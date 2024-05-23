@@ -414,11 +414,23 @@ func (c *RolloutController) listStatefulSetsWithRolloutGroup() ([]*v1.StatefulSe
 	return deepCopy, nil
 }
 
+func getTotalReplicas(sts *v1.StatefulSet) int32 {
+	if (sts.Spec.Replicas == nil) || (*sts.Spec.Replicas < 0) {
+		panic(fmt.Sprintf("StatefulSet %s has invalid replicas field: %v", sts.Name, sts.Spec.Replicas))
+		return sts.Status.Replicas
+	}
+	if *sts.Spec.Replicas != sts.Status.Replicas {
+		panic(fmt.Sprintf("StatefulSet %s has mismatched replicas field: %v vs %v", sts.Name, *sts.Spec.Replicas, sts.Status.Replicas))
+	}
+	return *sts.Spec.Replicas
+}
+
 func (c *RolloutController) hasStatefulSetNotReadyPods(sts *v1.StatefulSet) (bool, error) {
 	// We can quickly check the number of ready replicas reported by the StatefulSet.
 	// If they don't match the total number of replicas, then we're sure there are some
 	// not ready pods.
-	if *sts.Spec.Replicas != sts.Status.ReadyReplicas {
+	totalReplicas := getTotalReplicas(sts)
+	if totalReplicas != sts.Status.ReadyReplicas {
 		return true, nil
 	}
 
@@ -430,11 +442,11 @@ func (c *RolloutController) hasStatefulSetNotReadyPods(sts *v1.StatefulSet) (boo
 		return false, err
 	}
 
-	if len(pods) < int(*sts.Spec.Replicas) {
+	if len(pods) < int(totalReplicas) {
 		level.Info(c.logger).Log(
 			"msg", "StatefulSet status is reporting all pods ready, but the rollout operator found less pods than expected",
 			"statefulset", sts.Name,
-			"expected_replicas", *sts.Spec.Replicas,
+			"expected_replicas", totalReplicas,
 			"found_pods", len(pods),
 		)
 		return true, nil
@@ -536,7 +548,8 @@ func (c *RolloutController) updateStatefulSetPods(ctx context.Context, sts *v1.S
 		}
 
 		maxUnavailable := getMaxUnavailableForStatefulSet(sts, c.logger)
-		numNotReady := int(*sts.Spec.Replicas - sts.Status.ReadyReplicas)
+		totalReplicas := getTotalReplicas(sts)
+		numNotReady := int(totalReplicas - sts.Status.ReadyReplicas)
 
 		// Compute the number of pods we should update, honoring the configured maxUnavailable.
 		numPods := max(0, min(
@@ -549,7 +562,7 @@ func (c *RolloutController) updateStatefulSetPods(ctx context.Context, sts *v1.S
 				"msg", "StatefulSet has some pods to be updated but maxUnavailable pods has been reached",
 				"statefulset", sts.Name,
 				"pods_to_update", len(podsToUpdate),
-				"replicas", *sts.Spec.Replicas,
+				"replicas", totalReplicas,
 				"ready_replicas", sts.Status.ReadyReplicas,
 				"max_unavailable", maxUnavailable)
 
