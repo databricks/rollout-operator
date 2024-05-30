@@ -416,11 +416,7 @@ func (c *RolloutController) listStatefulSetsWithRolloutGroup() ([]*v1.StatefulSe
 
 func getTotalReplicas(sts *v1.StatefulSet) int32 {
 	if (sts.Spec.Replicas == nil) || (*sts.Spec.Replicas < 0) {
-		panic(fmt.Sprintf("StatefulSet %s has invalid replicas field: %v", sts.Name, sts.Spec.Replicas))
 		return sts.Status.Replicas
-	}
-	if *sts.Spec.Replicas != sts.Status.Replicas {
-		panic(fmt.Sprintf("StatefulSet %s has mismatched replicas field: %v vs %v", sts.Name, *sts.Spec.Replicas, sts.Status.Replicas))
 	}
 	return *sts.Spec.Replicas
 }
