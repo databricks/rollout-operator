@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -25,9 +26,9 @@ func TestRolloutHappyCase(t *testing.T) {
 	requireEventuallyPod(t, api, ctx, rolloutOperatorPod, expectPodPhase(corev1.PodRunning), expectReady())
 
 	// Create mock service, and check that it is in the desired state.
-	createMockServiceZone(t, ctx, api, corev1.NamespaceDefault, "mock-zone-a")
-	createMockServiceZone(t, ctx, api, corev1.NamespaceDefault, "mock-zone-b")
-	createMockServiceZone(t, ctx, api, corev1.NamespaceDefault, "mock-zone-c")
+	sts_a := createMockServiceZone(t, ctx, api, corev1.NamespaceDefault, "mock-zone-a")
+	sts_b := createMockServiceZone(t, ctx, api, corev1.NamespaceDefault, "mock-zone-b")
+	sts_c := createMockServiceZone(t, ctx, api, corev1.NamespaceDefault, "mock-zone-c")
 	requireEventuallyPod(t, api, ctx, "mock-zone-a-0", expectPodPhase(corev1.PodRunning), expectReady(), expectVersion("1"))
 	requireEventuallyPod(t, api, ctx, "mock-zone-b-0", expectPodPhase(corev1.PodRunning), expectReady(), expectVersion("1"))
 	requireEventuallyPod(t, api, ctx, "mock-zone-c-0", expectPodPhase(corev1.PodRunning), expectReady(), expectVersion("1"))
@@ -44,6 +45,10 @@ func TestRolloutHappyCase(t *testing.T) {
 	requireEventuallyPod(t, api, ctx, "mock-zone-a-0", expectNotReady(), expectVersion("2"))
 	requireEventuallyPod(t, api, ctx, "mock-zone-b-0", expectReady(), expectVersion("1"))
 	requireEventuallyPod(t, api, ctx, "mock-zone-c-0", expectReady(), expectVersion("1"))
+
+	fmt.Println(sts_a.Status.Replicas, sts_a.Status.ReadyReplicas)
+	fmt.Println(sts_b.Status.Replicas, sts_b.Status.ReadyReplicas)
+	fmt.Println(sts_c.Status.Replicas, sts_c.Status.ReadyReplicas)
 
 	// zone-a becomes ready, zone-b should become not ready and be version 2.
 	makeMockReady(t, cluster, "mock-zone-a")

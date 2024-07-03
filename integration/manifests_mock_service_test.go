@@ -16,12 +16,10 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-func createMockServiceZone(t *testing.T, ctx context.Context, api *kubernetes.Clientset, namespace, name string) {
+func createMockServiceZone(t *testing.T, ctx context.Context, api *kubernetes.Clientset, namespace, name string) *appsv1.StatefulSet {
 	t.Helper()
-	{
-		_, err := api.AppsV1().StatefulSets(namespace).Create(ctx, mockServiceStatefulSet(name, "1", true), metav1.CreateOptions{})
-		require.NoError(t, err, "Can't create StatefulSet")
-	}
+	sts, err := api.AppsV1().StatefulSets(namespace).Create(ctx, mockServiceStatefulSet(name, "1", true), metav1.CreateOptions{})
+	require.NoError(t, err, "Can't create StatefulSet")
 
 	{
 		_, err := api.CoreV1().Services(namespace).Create(ctx, mockServiceService(name), metav1.CreateOptions{})
@@ -31,6 +29,7 @@ func createMockServiceZone(t *testing.T, ctx context.Context, api *kubernetes.Cl
 		_, err := api.NetworkingV1().Ingresses(namespace).Create(ctx, mockServiceIngress(name), metav1.CreateOptions{})
 		require.NoError(t, err, "Can't create Ingress")
 	}
+	return sts
 }
 
 func mockServiceService(name string) *corev1.Service {
