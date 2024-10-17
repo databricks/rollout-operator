@@ -43,6 +43,46 @@ func cancelDelayedDownscaleIfConfigured(ctx context.Context, logger log.Logger, 
 	callCancelDelayedDownscale(ctx, logger, httpClient, endpoints)
 }
 
+func checkScalable(ctx context.Context, logger log.Logger, sts *v1.StatefulSet, httpClient httpClient, currentReplicas, desiredReplicas int32) (updatedDesiredReplicas int32, _ error) {
+	if desiredReplicas >= currentReplicas {
+		return desiredReplicas, nil
+	}
+
+	prepareURL, err := parseDownscaleURLAnnotation(sts.GetAnnotations())
+	if prepareURL == nil || err != nil {
+		return currentReplicas, err
+	}
+	downscaleEndpoints := createPrepareDownscaleEndpoints(sts.Namespace, sts.GetName(), getStsSvcName(sts), int(desiredReplicas), int(currentReplicas), prepareURL)
+	scalableBooleans, err := callPerpareDownscaleAndReturnScalable(ctx, logger, httpClient, downscaleEndpoints)
+	if err != nil {
+		return currentReplicas, fmt.Errorf("failed prepare pods for delayed downscale: %v", err)
+	}
+
+	// Find how many pods from the end of statefulset we can already scale down
+	allowedDesiredReplicas := currentReplicas
+	for replica := currentReplicas - 1; replica >= desiredReplicas; replica-- {
+		scalable, ok := scalableBooleans[int(replica)]
+		if !ok {
+			break
+		}
+
+		if !scalable {
+			break
+		}
+
+		// We can scale down this replica
+		allowedDesiredReplicas--
+	}
+
+	if allowedDesiredReplicas == currentReplicas {
+		return currentReplicas, fmt.Errorf("downscale not possible for any pods at the end of statefulset replicas range")
+	}
+
+	// We can proceed with downscale on at least one pod.
+	level.Info(logger).Log("msg", "downscale possible on some pods", "name", sts.GetName(), "originalDesiredReplicas", desiredReplicas, "allowedDesiredReplicas", allowedDesiredReplicas)
+	return allowedDesiredReplicas, nil
+}
+
 // Checks if downscale delay has been reached on replicas in [desiredReplicas, currentReplicas) range.
 // If there is a range of replicas at the end of statefulset for which delay has been reached, this function
 // returns updated desired replicas that statefulset can be scaled to.
@@ -104,6 +144,20 @@ func checkScalingDelay(ctx context.Context, logger log.Logger, sts *v1.StatefulS
 	return allowedDesiredReplicas, nil
 }
 
+func parseDownscaleURLAnnotation(annotations map[string]string) (*url.URL, error) {
+	urlStr := annotations[config.PrepareDownscalePathAnnotationKey]
+	if urlStr == "" {
+		return nil, nil
+	}
+
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse %s annotation value as URL: %v", config.PrepareDownscalePathAnnotationKey, err)
+	}
+
+	return u, nil
+}
+
 func parseDelayedDownscaleAnnotations(annotations map[string]string) (time.Duration, *url.URL, error) {
 	delayStr := annotations[config.RolloutDelayedDownscaleAnnotationKey]
 	urlStr := annotations[config.RolloutDelayedDownscalePrepareUrlAnnotationKey]
@@ -161,6 +215,61 @@ func createPrepareDownscaleEndpoints(namespace, stsName, serviceName string, fro
 	}
 
 	return eps
+}
+
+func callPerpareDownscaleAndReturnScalable(ctx context.Context, logger log.Logger, client httpClient, endpoints []endpoint) (map[int]bool, error) {
+	if len(endpoints) == 0 {
+		return nil, fmt.Errorf("no endpoints")
+	}
+
+	var (
+		scalableMu sync.Mutex
+		scalable   = map[int]bool{}
+	)
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(32)
+
+	for ix := range endpoints {
+		ep := endpoints[ix]
+		g.Go(func() error {
+			target := ep.url.String()
+
+			epLogger := log.With(logger, "pod", ep.podName, "url", target)
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, nil)
+			if err != nil {
+				level.Error(epLogger).Log("msg", "error creating HTTP POST request to endpoint", "err", err)
+				return err
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				level.Error(epLogger).Log("msg", "error sending HTTP POST request to endpoint", "err", err)
+				return err
+			}
+
+			defer resp.Body.Close()
+
+			scalableMu.Lock()
+			if resp.StatusCode == 200 {
+				scalable[ep.replica] = true
+			} else {
+				if resp.StatusCode != 425 {
+					// 425 too early
+					level.Error(epLogger).Log("msg", "downscale POST got unexpected status", resp.StatusCode)
+				}
+				scalable[ep.replica] = false
+			}
+			scalable[ep.replica] = true
+			scalableMu.Unlock()
+
+			level.Debug(epLogger).Log("msg", "downscale POST got status", resp.StatusCode)
+			return nil
+		})
+	}
+	err := g.Wait()
+	return scalable, err
+
 }
 
 func callPrepareDownscaleAndReturnElapsedDurationsSinceInitiatedDownscale(ctx context.Context, logger log.Logger, client httpClient, endpoints []endpoint) (map[int]time.Duration, error) {
