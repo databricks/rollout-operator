@@ -36,7 +36,9 @@ func (c *RolloutController) adjustStatefulSetsGroupReplicasToMirrorResource(ctx 
 		referenceResource := fmt.Sprintf("%s/%s", referenceGVR.Resource, referenceName)
 
 		referenceResourceDesiredReplicas := scaleObj.Spec.Replicas
-		sts.Annotations[config.StatefulsetDesiredReplicasAnnotationKey] = fmt.Sprintf("%v", referenceResourceDesiredReplicas)
+		if err := c.patchStatefulSetDesiredReplicasAnnotation(ctx, sts, referenceResourceDesiredReplicas); err != nil {
+			level.Error(c.logger).Log("msg", "failed to patch desired replicas annotation on statefulset", "err", err)
+		}
 		if currentReplicas == referenceResourceDesiredReplicas {
 			updateStatusReplicasOnReferenceResourceIfNeeded(ctx, c.logger, c.dynamicClient, sts, scaleObj, referenceGVR, referenceName, referenceResourceDesiredReplicas)
 			cancelDelayedDownscaleIfConfigured(ctx, c.logger, sts, client, referenceResourceDesiredReplicas)
