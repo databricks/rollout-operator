@@ -158,6 +158,23 @@ func parseDownscaleURLAnnotation(annotations map[string]string) (*url.URL, error
 	return u, nil
 }
 
+func parseDownscaleDelayAnnotation(annotations map[string]string) (time.Duration, error) {
+	delayStr := annotations[config.RolloutDelayedDownscaleAnnotationKey]
+	if delayStr == "" {
+		return 0, nil
+	}
+
+	d, err := model.ParseDuration(delayStr)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse %s annotation value as duration: %v", config.RolloutDelayedDownscaleAnnotationKey, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("negative value of %s annotation: %v", config.RolloutDelayedDownscaleAnnotationKey, delayStr)
+	}
+
+	return time.Duration(d), nil
+}
+
 func parseDelayedDownscaleAnnotations(annotations map[string]string) (time.Duration, *url.URL, error) {
 	delayStr := annotations[config.RolloutDelayedDownscaleAnnotationKey]
 	urlStr := annotations[config.RolloutDelayedDownscalePrepareUrlAnnotationKey]
