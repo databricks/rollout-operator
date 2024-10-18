@@ -637,6 +637,9 @@ func (c *RolloutController) patchStatefulSetSpecReplicas(ctx context.Context, st
 }
 
 func (c *RolloutController) patchStatefulSetDesiredReplicasAnnotation(ctx context.Context, sts *v1.StatefulSet, replicas int32) error {
+	if _, ok := sts.ObjectMeta.Annotations[config.StatefulsetDesiredReplicasAnnotationKey]; !ok {
+		return nil
+	}
 	patch := fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%d"}}}`, config.StatefulsetDesiredReplicasAnnotationKey, replicas)
 	_, err := c.kubeClient.AppsV1().StatefulSets(c.namespace).Patch(ctx, sts.GetName(), types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
 	return err
