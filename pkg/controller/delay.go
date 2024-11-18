@@ -142,7 +142,7 @@ func checkScalingDelay(ctx context.Context, logger log.Logger, sts *v1.StatefulS
 }
 
 func parseDownscaleURLAnnotation(annotations map[string]string) (*url.URL, error) {
-	urlStr := annotations[config.PrepareDownscalePathAnnotationKey]
+	urlStr := annotations[config.RolloutDelayedDownscalePrepareUrlAnnotationKey]
 	if urlStr == "" {
 		return nil, nil
 	}
@@ -260,7 +260,6 @@ func callPerpareDownscaleAndReturnScalable(ctx context.Context, logger log.Logge
 				}
 				scalable[ep.replica] = false
 			}
-			scalable[ep.replica] = true
 			scalableMu.Unlock()
 
 			level.Debug(epLogger).Log("msg", "downscale POST got status", resp.StatusCode)
