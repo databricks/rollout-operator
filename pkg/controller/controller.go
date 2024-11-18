@@ -209,7 +209,7 @@ func (c *RolloutController) reconcile(ctx context.Context) error {
 	span, ctx := opentracing.StartSpanFromContext(ctx, "RolloutController.reconcile()")
 	defer span.Finish()
 
-	level.Info(c.logger).Log("msg", "reconcile started (minReadySeconds version)")
+	level.Info(c.logger).Log("msg", "reconcile started")
 
 	sets, err := c.listStatefulSetsWithRolloutGroup()
 	if err != nil {
