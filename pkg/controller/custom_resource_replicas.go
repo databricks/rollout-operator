@@ -36,6 +36,7 @@ func (c *RolloutController) adjustStatefulSetsGroupReplicasToMirrorResource(ctx 
 		referenceResource := fmt.Sprintf("%s/%s", referenceGVR.Resource, referenceName)
 
 		referenceResourceDesiredReplicas := scaleObj.Spec.Replicas
+		c.desiredReplicas.WithLabelValues(sts.GetName()).Set(float64(referenceResourceDesiredReplicas))
 		if currentReplicas == referenceResourceDesiredReplicas {
 			updateStatusReplicasOnReferenceResourceIfNeeded(ctx, c.logger, c.dynamicClient, sts, scaleObj, referenceGVR, referenceName, referenceResourceDesiredReplicas)
 			cancelDelayedDownscaleIfConfigured(ctx, c.logger, sts, client, referenceResourceDesiredReplicas)
@@ -49,7 +50,7 @@ func (c *RolloutController) adjustStatefulSetsGroupReplicasToMirrorResource(ctx 
 		var desiredReplicas int32
 		if sts.GetAnnotations()[config.RolloutDelayedDownscaleAnnotationKey] == "boolean" {
 			level.Debug(c.logger).Log("msg", "boolean scaling logic")
-			desiredReplicas, err = checkScalingBoolean(ctx, c.logger, sts, client, currentReplicas, referenceResourceDesiredReplicas)
+			desiredReplicas, err = checkScalingBoolean(ctx, c.logger, sts, client, currentReplicas, referenceResourceDesiredReplicas, c.scaleDownBoolean)
 		} else {
 			desiredReplicas, err = checkScalingDelay(ctx, c.logger, sts, client, currentReplicas, referenceResourceDesiredReplicas)
 		}

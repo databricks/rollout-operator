@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"golang.org/x/sync/errgroup"
 	v1 "k8s.io/api/apps/v1"
@@ -43,7 +44,7 @@ func cancelDelayedDownscaleIfConfigured(ctx context.Context, logger log.Logger, 
 	callCancelDelayedDownscale(ctx, logger, httpClient, endpoints)
 }
 
-func checkScalingBoolean(ctx context.Context, logger log.Logger, sts *v1.StatefulSet, httpClient httpClient, currentReplicas, desiredReplicas int32) (updatedDesiredReplicas int32, _ error) {
+func checkScalingBoolean(ctx context.Context, logger log.Logger, sts *v1.StatefulSet, httpClient httpClient, currentReplicas, desiredReplicas int32, scaleDownBooleanMetric *prometheus.GaugeVec) (updatedDesiredReplicas int32, _ error) {
 	if desiredReplicas >= currentReplicas {
 		return desiredReplicas, nil
 	}
@@ -53,7 +54,7 @@ func checkScalingBoolean(ctx context.Context, logger log.Logger, sts *v1.Statefu
 		return currentReplicas, err
 	}
 	downscaleEndpoints := createPrepareDownscaleEndpoints(sts.Namespace, sts.GetName(), getStsSvcName(sts), int(desiredReplicas), int(currentReplicas), prepareURL)
-	scalableBooleans, err := callPerpareDownscaleAndReturnScalable(ctx, logger, httpClient, downscaleEndpoints)
+	scalableBooleans, err := callPerpareDownscaleAndReturnScalable(ctx, logger, httpClient, downscaleEndpoints, scaleDownBooleanMetric)
 	if err != nil {
 		return currentReplicas, fmt.Errorf("failed prepare pods for delayed downscale: %v", err)
 	}
@@ -217,7 +218,7 @@ func createPrepareDownscaleEndpoints(namespace, statefulsetName, serviceName str
 	return eps
 }
 
-func callPerpareDownscaleAndReturnScalable(ctx context.Context, logger log.Logger, client httpClient, endpoints []endpoint) (map[int]bool, error) {
+func callPerpareDownscaleAndReturnScalable(ctx context.Context, logger log.Logger, client httpClient, endpoints []endpoint, scaleDownBooleanMetric *prometheus.GaugeVec) (map[int]bool, error) {
 	if len(endpoints) == 0 {
 		return nil, fmt.Errorf("no endpoints")
 	}
@@ -253,12 +254,14 @@ func callPerpareDownscaleAndReturnScalable(ctx context.Context, logger log.Logge
 			scalableMu.Lock()
 			if resp.StatusCode == 200 {
 				scalable[ep.replica] = true
+				scaleDownBooleanMetric.WithLabelValues(ep.podName).Set(1)
 			} else {
 				if resp.StatusCode != 425 {
 					// 425 too early
 					level.Error(epLogger).Log("msg", "downscale POST got unexpected status", resp.StatusCode)
 				}
 				scalable[ep.replica] = false
+				scaleDownBooleanMetric.WithLabelValues(ep.podName).Set(0)
 			}
 			scalableMu.Unlock()
 
