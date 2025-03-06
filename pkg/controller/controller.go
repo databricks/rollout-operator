@@ -134,7 +134,7 @@ func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTM
 		}, []string{"statefulset_name"}),
 		scaleDownBoolean: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
 			Name: "rollout_operator_scale_down_boolean",
-			Help: "Boolean for whether an invester pod is ready to scale down.",
+			Help: "Boolean for whether an ingester pod is ready to scale down.",
 		}, []string{"scale_down_pod_name"}),
 	}
 
