@@ -67,10 +67,14 @@ type RolloutController struct {
 	stopCh chan struct{}
 
 	// Metrics.
-	groupReconcileTotal       *prometheus.CounterVec
-	groupReconcileFailed      *prometheus.CounterVec
-	groupReconcileDuration    *prometheus.HistogramVec
-	groupReconcileLastSuccess *prometheus.GaugeVec
+	groupReconcileTotal        *prometheus.CounterVec
+	groupReconcileFailed       *prometheus.CounterVec
+	groupReconcileDuration     *prometheus.HistogramVec
+	groupReconcileLastSuccess  *prometheus.GaugeVec
+	desiredReplicas            *prometheus.GaugeVec
+	scaleDownBoolean           *prometheus.GaugeVec
+	downscaleProbeTotal        *prometheus.CounterVec
+	downscaleProbeFailureTotal *prometheus.CounterVec
 
 	// Keep track of discovered rollout groups. We use this information to delete metrics
 	// related to rollout groups that have been decommissioned.
@@ -126,6 +130,22 @@ func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTM
 			Name: "rollout_operator_last_successful_group_reconcile_timestamp_seconds",
 			Help: "Timestamp of the last successful reconcile for a specific rollout group.",
 		}, []string{"rollout_group"}),
+		desiredReplicas: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
+			Name: "rollout_operator_statefulset_desired_replicas",
+			Help: "Desired replicas of a Statefulset parsed from CRD.",
+		}, []string{"statefulset_name"}),
+		scaleDownBoolean: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
+			Name: "rollout_operator_scale_down_boolean",
+			Help: "Boolean for whether an ingester pod is ready to scale down.",
+		}, []string{"scale_down_pod_name"}),
+		downscaleProbeTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "rollout_operator_downscale_probe_total",
+			Help: "Total number of downscale probes.",
+		}, []string{"scale_down_pod_name"}),
+		downscaleProbeFailureTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "rollout_operator_downscale_probe_failure_total",
+			Help: "Total number of failed downscale probes.",
+		}, []string{"scale_down_pod_name"}),
 	}
 
 	return c
@@ -209,7 +229,7 @@ func (c *RolloutController) reconcile(ctx context.Context) error {
 	span, ctx := opentracing.StartSpanFromContext(ctx, "RolloutController.reconcile()")
 	defer span.Finish()
 
-	level.Info(c.logger).Log("msg", "reconcile started (minReadySeconds version)")
+	level.Info(c.logger).Log("msg", "reconcile started")
 
 	sets, err := c.listStatefulSetsWithRolloutGroup()
 	if err != nil {
