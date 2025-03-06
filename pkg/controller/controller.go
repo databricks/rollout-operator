@@ -67,12 +67,14 @@ type RolloutController struct {
 	stopCh chan struct{}
 
 	// Metrics.
-	groupReconcileTotal       *prometheus.CounterVec
-	groupReconcileFailed      *prometheus.CounterVec
-	groupReconcileDuration    *prometheus.HistogramVec
-	groupReconcileLastSuccess *prometheus.GaugeVec
-	desiredReplicas           *prometheus.GaugeVec
-	scaleDownBoolean          *prometheus.GaugeVec
+	groupReconcileTotal        *prometheus.CounterVec
+	groupReconcileFailed       *prometheus.CounterVec
+	groupReconcileDuration     *prometheus.HistogramVec
+	groupReconcileLastSuccess  *prometheus.GaugeVec
+	desiredReplicas            *prometheus.GaugeVec
+	scaleDownBoolean           *prometheus.GaugeVec
+	downscaleProbeTotal        *prometheus.CounterVec
+	downscaleProbeFailureTotal *prometheus.CounterVec
 
 	// Keep track of discovered rollout groups. We use this information to delete metrics
 	// related to rollout groups that have been decommissioned.
@@ -135,6 +137,14 @@ func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTM
 		scaleDownBoolean: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
 			Name: "rollout_operator_scale_down_boolean",
 			Help: "Boolean for whether an ingester pod is ready to scale down.",
+		}, []string{"scale_down_pod_name"}),
+		downscaleProbeTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "rollout_operator_downscale_probe_total",
+			Help: "Total number of downscale probes.",
+		}, []string{"scale_down_pod_name"}),
+		downscaleProbeFailureTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "rollout_operator_downscale_probe_failure_total",
+			Help: "Total number of failed downscale probes.",
 		}, []string{"scale_down_pod_name"}),
 	}
 
