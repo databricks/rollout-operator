@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -427,7 +428,10 @@ func (c *RolloutController) hasStatefulSetNotReadyPods(sts *v1.StatefulSet) (boo
 	// We can quickly check the number of ready replicas reported by the StatefulSet.
 	// If they don't match the total number of replicas, then we're sure there are some
 	// not ready pods.
-	if sts.Status.Replicas != sts.Status.ReadyReplicas {
+	// This is causing issues when enable parallel db update (delete multiple pods at the same time):
+	// 1. use Spec.Replicas instead of Status.Replicas because of deleting multiple pods at the same time will cause Status.Replicas < Spec.Replicas
+	// 2. use Status.AvailableReplicas instead of Status.ReadyReplicas because of minReadySeconds > 0 & stability
+	if *sts.Spec.Replicas != sts.Status.AvailableReplicas {
 		return true, nil
 	}
 
@@ -626,6 +630,16 @@ func (c *RolloutController) podsNotMatchingUpdateRevision(sts *v1.StatefulSet) (
 
 	// Sort pods in order to provide a deterministic behaviour.
 	util.SortPods(pods)
+	// Sort pods so not running pods will be updated first.
+	sort.Slice(pods, func(i, j int) bool {
+		rank := func(p *corev1.Pod) int {
+			if p.Status.Phase == corev1.PodRunning {
+				return 1 // Running pods are ranked higher and will be updated last.
+			}
+			return 0 // Running pods are ranked lower and will be updated first.
+		}
+		return rank(pods[i]) < rank(pods[j])
+	})
 
 	return pods, nil
 }
