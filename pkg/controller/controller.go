@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -67,10 +68,14 @@ type RolloutController struct {
 	stopCh chan struct{}
 
 	// Metrics.
-	groupReconcileTotal       *prometheus.CounterVec
-	groupReconcileFailed      *prometheus.CounterVec
-	groupReconcileDuration    *prometheus.HistogramVec
-	groupReconcileLastSuccess *prometheus.GaugeVec
+	groupReconcileTotal        *prometheus.CounterVec
+	groupReconcileFailed       *prometheus.CounterVec
+	groupReconcileDuration     *prometheus.HistogramVec
+	groupReconcileLastSuccess  *prometheus.GaugeVec
+	desiredReplicas            *prometheus.GaugeVec
+	scaleDownBoolean           *prometheus.GaugeVec
+	downscaleProbeTotal        *prometheus.CounterVec
+	downscaleProbeFailureTotal *prometheus.CounterVec
 
 	// Keep track of discovered rollout groups. We use this information to delete metrics
 	// related to rollout groups that have been decommissioned.
@@ -126,6 +131,22 @@ func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTM
 			Name: "rollout_operator_last_successful_group_reconcile_timestamp_seconds",
 			Help: "Timestamp of the last successful reconcile for a specific rollout group.",
 		}, []string{"rollout_group"}),
+		desiredReplicas: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
+			Name: "rollout_operator_statefulset_desired_replicas",
+			Help: "Desired replicas of a Statefulset parsed from CRD.",
+		}, []string{"statefulset_name"}),
+		scaleDownBoolean: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
+			Name: "rollout_operator_scale_down_boolean",
+			Help: "Boolean for whether an ingester pod is ready to scale down.",
+		}, []string{"scale_down_pod_name"}),
+		downscaleProbeTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "rollout_operator_downscale_probe_total",
+			Help: "Total number of downscale probes.",
+		}, []string{"scale_down_pod_name"}),
+		downscaleProbeFailureTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "rollout_operator_downscale_probe_failure_total",
+			Help: "Total number of failed downscale probes.",
+		}, []string{"scale_down_pod_name"}),
 	}
 
 	return c
@@ -209,7 +230,7 @@ func (c *RolloutController) reconcile(ctx context.Context) error {
 	span, ctx := opentracing.StartSpanFromContext(ctx, "RolloutController.reconcile()")
 	defer span.Finish()
 
-	level.Info(c.logger).Log("msg", "reconcile started (minReadySeconds version)")
+	level.Info(c.logger).Log("msg", "reconcile started")
 
 	sets, err := c.listStatefulSetsWithRolloutGroup()
 	if err != nil {
@@ -404,6 +425,13 @@ func (c *RolloutController) listStatefulSetsWithRolloutGroup() ([]*v1.StatefulSe
 }
 
 func (c *RolloutController) hasStatefulSetNotReadyPods(sts *v1.StatefulSet) (bool, error) {
+	if getMaxUnavailableForStatefulSet(sts, c.logger) > 1 && *sts.Spec.Replicas != sts.Status.AvailableReplicas {
+		// This is causing issues when enable parallel db update (delete multiple pods at the same time):
+		// 1. use Spec.Replicas instead of Status.Replicas because of deleting multiple pods at the same time will cause Status.Replicas < Spec.Replicas
+		// 2. use Status.AvailableReplicas instead of Status.ReadyReplicas because of minReadySeconds > 0 & stability
+		return true, nil
+	}
+	// fallback to old behavior if maxUnavailable is <= 1.
 	// We can quickly check the number of ready replicas reported by the StatefulSet.
 	// If they don't match the total number of replicas, then we're sure there are some
 	// not ready pods.
@@ -489,7 +517,7 @@ func (c *RolloutController) listPods(sel labels.Selector) ([]*corev1.Pod, error)
 }
 
 func (c *RolloutController) updateStatefulSetPods(ctx context.Context, sts *v1.StatefulSet) (bool, error) {
-	level.Debug(c.logger).Log("msg", "reconciling StatefulSet", "statefulset", sts.Name)
+	level.Debug(c.logger).Log("msg", "reconciling StatefulSet==============", "statefulset", sts.Name)
 
 	podsToUpdate, err := c.podsNotMatchingUpdateRevision(sts)
 	if err != nil {
@@ -500,10 +528,13 @@ func (c *RolloutController) updateStatefulSetPods(ctx context.Context, sts *v1.S
 		maxUnavailable := getMaxUnavailableForStatefulSet(sts, c.logger)
 		var numNotAvailable int
 		if sts.Spec.MinReadySeconds > 0 {
-			level.Info(c.logger).Log("msg", "StatefulSet has minReadySeconds set, waiting before terminating pods", "statefulset", sts.Name, "min_ready_seconds", sts.Spec.MinReadySeconds)
 			numNotAvailable = int(sts.Status.Replicas - sts.Status.AvailableReplicas)
 		} else {
 			numNotAvailable = int(sts.Status.Replicas - sts.Status.ReadyReplicas)
+		}
+		if maxUnavailable > 1 {
+			// when deleting multiple pods at the same time, the number of not-available pods should include pods that hasn't been managed by the controller yet.
+			numNotAvailable += int(*sts.Spec.Replicas - sts.Status.Replicas)
 		}
 
 		// Compute the number of pods we should update, honoring the configured maxUnavailable.
@@ -517,11 +548,13 @@ func (c *RolloutController) updateStatefulSetPods(ctx context.Context, sts *v1.S
 				"msg", "StatefulSet has some pods to be updated but maxUnavailable pods has been reached",
 				"statefulset", sts.Name,
 				"pods_to_update", len(podsToUpdate),
+				"pod[0]", podsToUpdate[0].Name,
+				"expected_replicas", sts.Spec.Replicas,
 				"replicas", sts.Status.Replicas,
 				"ready_replicas", sts.Status.ReadyReplicas,
 				"available_replicas", sts.Status.AvailableReplicas,
+				"num_not_available", numNotAvailable,
 				"max_unavailable", maxUnavailable)
-
 			return true, nil
 		}
 
@@ -606,6 +639,16 @@ func (c *RolloutController) podsNotMatchingUpdateRevision(sts *v1.StatefulSet) (
 
 	// Sort pods in order to provide a deterministic behaviour.
 	util.SortPods(pods)
+	// Sort pods so not running pods will be updated first.
+	sort.Slice(pods, func(i, j int) bool {
+		rank := func(p *corev1.Pod) int {
+			if p.Status.Phase == corev1.PodRunning {
+				return 1 // Running pods are ranked higher and will be updated last.
+			}
+			return 0 // Non-running pods are ranked lower and will be updated first.
+		}
+		return rank(pods[i]) < rank(pods[j])
+	})
 
 	return pods, nil
 }
