@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"time"
 
@@ -160,7 +161,7 @@ func parseDelayedDownscaleAnnotations(annotations map[string]string) (time.Durat
 	delayStr := annotations[config.RolloutDelayedDownscaleAnnotationKey]
 	urlStr := annotations[config.RolloutDelayedDownscalePrepareUrlAnnotationKey]
 
-	if delayStr == "" || urlStr == "" {
+	if delayStr == "" || delayStr == "boolean" || urlStr == "" {
 		return 0, nil, nil
 	}
 
@@ -254,7 +255,7 @@ func callPerpareDownscaleAndReturnScalable(ctx context.Context, logger log.Logge
 			defer resp.Body.Close()
 
 			scalableMu.Lock()
-			downscaleProbeTotal.WithLabelValues(ep.podName, resp.Status).Inc()
+			downscaleProbeTotal.WithLabelValues(ep.podName, strconv.Itoa(resp.StatusCode)).Inc()
 			if resp.StatusCode == 200 {
 				scalable[ep.replica] = true
 			} else {
