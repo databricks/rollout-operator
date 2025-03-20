@@ -161,7 +161,7 @@ func parseDelayedDownscaleAnnotations(annotations map[string]string) (time.Durat
 	delayStr := annotations[config.RolloutDelayedDownscaleAnnotationKey]
 	urlStr := annotations[config.RolloutDelayedDownscalePrepareUrlAnnotationKey]
 
-	if delayStr == "" || urlStr == "" {
+	if delayStr == "" || delayStr == "boolean" || urlStr == "" {
 		return 0, nil, nil
 	}
 
