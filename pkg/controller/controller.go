@@ -80,6 +80,7 @@ type RolloutController struct {
 	removeLastAppliedReplicaTotal      *prometheus.CounterVec
 	removeLastAppliedReplicaEmptyTotal *prometheus.CounterVec
 	removeLastAppliedReplicaErrorTotal *prometheus.CounterVec
+	downscaleState                     *prometheus.GaugeVec
 
 	// Keep track of discovered rollout groups. We use this information to delete metrics
 	// related to rollout groups that have been decommissioned.
@@ -156,6 +157,10 @@ func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTM
 			Name: "rollout_operator_remove_last_applied_replicas_error_total",
 			Help: "Total number of errors while removing .spec.replicas field from last-applied-configuration annotation.",
 		}, []string{"statefulset_name", "error"}),
+		downscaleState: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
+			Name: "rollout_operator_downscale_state",
+			Help: "State of the downscale operation.",
+		}, []string{"statefulset_name"}),
 	}
 
 	return c
