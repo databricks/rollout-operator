@@ -70,17 +70,17 @@ type RolloutController struct {
 	stopCh chan struct{}
 
 	// Metrics.
-	groupReconcileTotal                *prometheus.CounterVec
-	groupReconcileFailed               *prometheus.CounterVec
-	groupReconcileDuration             *prometheus.HistogramVec
-	groupReconcileLastSuccess          *prometheus.GaugeVec
-	desiredReplicas                    *prometheus.GaugeVec
-	downscaleProbeTotal                *prometheus.CounterVec
-	removeLastAppliedReplicaTotal      *prometheus.CounterVec
-	removeLastAppliedReplicaEmptyTotal *prometheus.CounterVec
-	removeLastAppliedReplicaErrorTotal *prometheus.CounterVec
-	downscaleState                     *prometheus.GaugeVec
-	lastAppliedReplicasPresent         *prometheus.GaugeVec
+	groupReconcileTotal                 *prometheus.CounterVec
+	groupReconcileFailed                *prometheus.CounterVec
+	groupReconcileDuration              *prometheus.HistogramVec
+	groupReconcileLastSuccess           *prometheus.GaugeVec
+	desiredReplicas                     *prometheus.GaugeVec
+	downscaleProbeTotal                 *prometheus.CounterVec
+	removeLastAppliedReplicasTotal      *prometheus.CounterVec
+	removeLastAppliedReplicasEmptyTotal *prometheus.CounterVec
+	removeLastAppliedReplicasErrorTotal *prometheus.CounterVec
+	lastAppliedReplicasRemovedTotal     *prometheus.CounterVec
+	downscaleState                      *prometheus.GaugeVec
 
 	// Keep track of discovered rollout groups. We use this information to delete metrics
 	// related to rollout groups that have been decommissioned.
@@ -144,25 +144,25 @@ func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTM
 			Name: "rollout_operator_downscale_probe_total",
 			Help: "Total number of downscale probes.",
 		}, []string{"scale_down_pod_name", "status"}),
-		removeLastAppliedReplicaTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		removeLastAppliedReplicasTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "rollout_operator_remove_last_applied_replicas_total",
 			Help: "Total number of removal of .spec.replicas field from last-applied-configuration annotation.",
 		}, []string{"statefulset_name"}),
-		removeLastAppliedReplicaEmptyTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		removeLastAppliedReplicasEmptyTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "rollout_operator_remove_last_applied_replicas_empty_total",
 			Help: "Total number of empty .spec.replicas field from last-applied-configuration annotation.",
 		}, []string{"statefulset_name"}),
-		removeLastAppliedReplicaErrorTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		removeLastAppliedReplicasErrorTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "rollout_operator_remove_last_applied_replicas_error_total",
 			Help: "Total number of errors while removing .spec.replicas field from last-applied-configuration annotation.",
 		}, []string{"statefulset_name", "error"}),
+		lastAppliedReplicasRemovedTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "rollout_operator_last_applied_replicas_removed_total",
+			Help: "Total number of .spec.replicas fields removed from last-applied-configuration annotation.",
+		}, []string{"statefulset_name"}),
 		downscaleState: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
 			Name: "rollout_operator_downscale_state",
 			Help: "State of the downscale operation.",
-		}, []string{"statefulset_name"}),
-		lastAppliedReplicasPresent: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
-			Name: "rollout_operator_last_applied_replicas_present",
-			Help: "Whether the last-applied-configuration annotation contains .spec.replicas field.",
 		}, []string{"statefulset_name"}),
 	}
 
@@ -716,46 +716,44 @@ func (c *RolloutController) removeReplicasFromLastApplied(
 	const jsonEncodeErr = "JsonEncodeErr"
 	const stsPatchErr = "StsPatchErr"
 
-	c.removeLastAppliedReplicaTotal.WithLabelValues(sts.GetName()).Inc()
+	c.removeLastAppliedReplicasTotal.WithLabelValues(sts.GetName()).Inc()
 	anns := sts.GetAnnotations()
 	if anns == nil {
-		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), noAnnotationErr).Inc()
+		c.removeLastAppliedReplicasErrorTotal.WithLabelValues(sts.GetName(), noAnnotationErr).Inc()
 		return fmt.Errorf("no annotation found on statefulset %s", sts.GetName())
 	}
 	raw, ok := anns[lastAppConfAnnKey]
 	if !ok || raw == "" {
-		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), lastAppliedNotFoundErr).Inc()
+		c.removeLastAppliedReplicasErrorTotal.WithLabelValues(sts.GetName(), lastAppliedNotFoundErr).Inc()
 		return fmt.Errorf("last applied annotation not found in statefulset %s annotations", sts.GetName())
 	}
 
 	// Decode annotation JSON.
 	var obj map[string]any
 	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
-		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), jsonDecodeErr).Inc()
+		c.removeLastAppliedReplicasErrorTotal.WithLabelValues(sts.GetName(), jsonDecodeErr).Inc()
 		return fmt.Errorf("unmarshal %s: %w", lastAppConfAnnKey, err)
 	}
 
 	// Remove spec.replicas.
 	if spec, ok := obj["spec"].(map[string]any); ok {
 		if _, ok := spec["replicas"]; !ok {
-			c.lastAppliedReplicasPresent.WithLabelValues(sts.GetName()).Set(0)
-			c.removeLastAppliedReplicaEmptyTotal.WithLabelValues(sts.GetName()).Inc()
+			c.removeLastAppliedReplicasEmptyTotal.WithLabelValues(sts.GetName()).Inc()
 			return nil
 		}
-		c.lastAppliedReplicasPresent.WithLabelValues(sts.GetName()).Set(1)
 		delete(spec, "replicas")
 		if len(spec) == 0 {
 			delete(obj, "spec")
 		}
 	} else {
-		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), specNotFoundErr).Inc()
+		c.removeLastAppliedReplicasErrorTotal.WithLabelValues(sts.GetName(), specNotFoundErr).Inc()
 		return fmt.Errorf("no spec found on statefulset %s last applied annotation", sts.GetName())
 	}
 
 	// Encode updated annotation.
 	newRaw, err := json.Marshal(obj)
 	if err != nil {
-		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), jsonEncodeErr).Inc()
+		c.removeLastAppliedReplicasErrorTotal.WithLabelValues(sts.GetName(), jsonEncodeErr).Inc()
 		return fmt.Errorf("marshal %s: %w", lastAppConfAnnKey, err)
 	}
 
@@ -769,8 +767,9 @@ func (c *RolloutController) removeReplicasFromLastApplied(
 		StatefulSets(c.namespace).
 		Patch(ctx, sts.GetName(), types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
 	if err != nil {
-		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), stsPatchErr).Inc()
+		c.removeLastAppliedReplicasErrorTotal.WithLabelValues(sts.GetName(), stsPatchErr).Inc()
 		return err
 	}
+	c.lastAppliedReplicasRemovedTotal.WithLabelValues(sts.GetName()).Inc()
 	return nil
 }
