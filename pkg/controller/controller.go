@@ -48,21 +48,20 @@ type httpClient interface {
 }
 
 type RolloutController struct {
-	kubeClient                kubernetes.Interface
-	namespace                 string
-	reconcileInterval         time.Duration
-	removeLastAppliedReplicas bool
-	statefulSetsFactory       informers.SharedInformerFactory
-	statefulSetLister         listersv1.StatefulSetLister
-	statefulSetsInformer      cache.SharedIndexInformer
-	podsFactory               informers.SharedInformerFactory
-	podLister                 corelisters.PodLister
-	podsInformer              cache.SharedIndexInformer
-	restMapper                meta.RESTMapper
-	scaleClient               scale.ScalesGetter
-	dynamicClient             dynamic.Interface
-	httpClient                httpClient
-	logger                    log.Logger
+	kubeClient           kubernetes.Interface
+	namespace            string
+	reconcileInterval    time.Duration
+	statefulSetsFactory  informers.SharedInformerFactory
+	statefulSetLister    listersv1.StatefulSetLister
+	statefulSetsInformer cache.SharedIndexInformer
+	podsFactory          informers.SharedInformerFactory
+	podLister            corelisters.PodLister
+	podsInformer         cache.SharedIndexInformer
+	restMapper           meta.RESTMapper
+	scaleClient          scale.ScalesGetter
+	dynamicClient        dynamic.Interface
+	httpClient           httpClient
+	logger               log.Logger
 
 	// This bool is true if we should trigger a reconcile.
 	shouldReconcile atomic.Bool
@@ -87,7 +86,7 @@ type RolloutController struct {
 	discoveredGroups map[string]struct{}
 }
 
-func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTMapper, scaleClient scale.ScalesGetter, dynamic dynamic.Interface, namespace string, client httpClient, reconcileInterval time.Duration, removeLastAppliedReplicas bool, reg prometheus.Registerer, logger log.Logger) *RolloutController {
+func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTMapper, scaleClient scale.ScalesGetter, dynamic dynamic.Interface, namespace string, client httpClient, reconcileInterval time.Duration, reg prometheus.Registerer, logger log.Logger) *RolloutController {
 	namespaceOpt := informers.WithNamespace(namespace)
 
 	// Initialise the StatefulSet informer to restrict the returned StatefulSets to only the ones
@@ -103,23 +102,22 @@ func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTM
 	podsInformer := podsFactory.Core().V1().Pods()
 
 	c := &RolloutController{
-		kubeClient:                kubeClient,
-		namespace:                 namespace,
-		reconcileInterval:         reconcileInterval,
-		removeLastAppliedReplicas: removeLastAppliedReplicas,
-		statefulSetsFactory:       statefulSetsFactory,
-		statefulSetLister:         statefulSetsInformer.Lister(),
-		statefulSetsInformer:      statefulSetsInformer.Informer(),
-		podsFactory:               podsFactory,
-		podLister:                 podsInformer.Lister(),
-		podsInformer:              podsInformer.Informer(),
-		restMapper:                restMapper,
-		scaleClient:               scaleClient,
-		dynamicClient:             dynamic,
-		httpClient:                client,
-		logger:                    logger,
-		stopCh:                    make(chan struct{}),
-		discoveredGroups:          map[string]struct{}{},
+		kubeClient:           kubeClient,
+		namespace:            namespace,
+		reconcileInterval:    reconcileInterval,
+		statefulSetsFactory:  statefulSetsFactory,
+		statefulSetLister:    statefulSetsInformer.Lister(),
+		statefulSetsInformer: statefulSetsInformer.Informer(),
+		podsFactory:          podsFactory,
+		podLister:            podsInformer.Lister(),
+		podsInformer:         podsInformer.Informer(),
+		restMapper:           restMapper,
+		scaleClient:          scaleClient,
+		dynamicClient:        dynamic,
+		httpClient:           client,
+		logger:               logger,
+		stopCh:               make(chan struct{}),
+		discoveredGroups:     map[string]struct{}{},
 		groupReconcileTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "rollout_operator_group_reconciles_total",
 			Help: "Total number of reconciles started for a specific rollout group.",
@@ -291,11 +289,9 @@ func (c *RolloutController) reconcileStatefulSetsGroup(ctx context.Context, grou
 	// Sort StatefulSets to provide a deterministic behaviour.
 	util.SortStatefulSets(sets)
 
-	if c.removeLastAppliedReplicas {
-		for _, s := range sets {
-			if err := c.removeReplicasFromLastApplied(ctx, s); err != nil {
-				level.Error(c.logger).Log("msg", "failed to remove replicas from last-applied-configuration annotation", "statefulset", s.Name, "err", err)
-			}
+	for _, s := range sets {
+		if err := c.removeReplicasFromLastApplied(ctx, s); err != nil {
+			level.Error(c.logger).Log("msg", "failed to remove replicas from last-applied-configuration annotation", "statefulset", s.Name, "err", err)
 		}
 	}
 
