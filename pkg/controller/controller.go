@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
@@ -39,6 +40,7 @@ const (
 	// How frequently informers should resync. This is also the frequency at which
 	// the operator reconciles even if no changes are made to the watched resources.
 	informerSyncInterval = 5 * time.Minute
+	lastAppConfAnnKey    = "kubectl.kubernetes.io/last-applied-configuration"
 )
 
 type httpClient interface {
@@ -46,20 +48,21 @@ type httpClient interface {
 }
 
 type RolloutController struct {
-	kubeClient           kubernetes.Interface
-	namespace            string
-	reconcileInterval    time.Duration
-	statefulSetsFactory  informers.SharedInformerFactory
-	statefulSetLister    listersv1.StatefulSetLister
-	statefulSetsInformer cache.SharedIndexInformer
-	podsFactory          informers.SharedInformerFactory
-	podLister            corelisters.PodLister
-	podsInformer         cache.SharedIndexInformer
-	restMapper           meta.RESTMapper
-	scaleClient          scale.ScalesGetter
-	dynamicClient        dynamic.Interface
-	httpClient           httpClient
-	logger               log.Logger
+	kubeClient                kubernetes.Interface
+	namespace                 string
+	reconcileInterval         time.Duration
+	removeLastAppliedReplicas bool
+	statefulSetsFactory       informers.SharedInformerFactory
+	statefulSetLister         listersv1.StatefulSetLister
+	statefulSetsInformer      cache.SharedIndexInformer
+	podsFactory               informers.SharedInformerFactory
+	podLister                 corelisters.PodLister
+	podsInformer              cache.SharedIndexInformer
+	restMapper                meta.RESTMapper
+	scaleClient               scale.ScalesGetter
+	dynamicClient             dynamic.Interface
+	httpClient                httpClient
+	logger                    log.Logger
 
 	// This bool is true if we should trigger a reconcile.
 	shouldReconcile atomic.Bool
@@ -68,19 +71,22 @@ type RolloutController struct {
 	stopCh chan struct{}
 
 	// Metrics.
-	groupReconcileTotal       *prometheus.CounterVec
-	groupReconcileFailed      *prometheus.CounterVec
-	groupReconcileDuration    *prometheus.HistogramVec
-	groupReconcileLastSuccess *prometheus.GaugeVec
-	desiredReplicas           *prometheus.GaugeVec
-	downscaleProbeTotal       *prometheus.CounterVec
+	groupReconcileTotal                *prometheus.CounterVec
+	groupReconcileFailed               *prometheus.CounterVec
+	groupReconcileDuration             *prometheus.HistogramVec
+	groupReconcileLastSuccess          *prometheus.GaugeVec
+	desiredReplicas                    *prometheus.GaugeVec
+	downscaleProbeTotal                *prometheus.CounterVec
+	removeLastAppliedReplicaTotal      *prometheus.CounterVec
+	removeLastAppliedReplicaEmptyTotal *prometheus.CounterVec
+	removeLastAppliedReplicaErrorTotal *prometheus.CounterVec
 
 	// Keep track of discovered rollout groups. We use this information to delete metrics
 	// related to rollout groups that have been decommissioned.
 	discoveredGroups map[string]struct{}
 }
 
-func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTMapper, scaleClient scale.ScalesGetter, dynamic dynamic.Interface, namespace string, client httpClient, reconcileInterval time.Duration, reg prometheus.Registerer, logger log.Logger) *RolloutController {
+func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTMapper, scaleClient scale.ScalesGetter, dynamic dynamic.Interface, namespace string, client httpClient, reconcileInterval time.Duration, removeLastAppliedReplicas bool, reg prometheus.Registerer, logger log.Logger) *RolloutController {
 	namespaceOpt := informers.WithNamespace(namespace)
 
 	// Initialise the StatefulSet informer to restrict the returned StatefulSets to only the ones
@@ -96,22 +102,23 @@ func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTM
 	podsInformer := podsFactory.Core().V1().Pods()
 
 	c := &RolloutController{
-		kubeClient:           kubeClient,
-		namespace:            namespace,
-		reconcileInterval:    reconcileInterval,
-		statefulSetsFactory:  statefulSetsFactory,
-		statefulSetLister:    statefulSetsInformer.Lister(),
-		statefulSetsInformer: statefulSetsInformer.Informer(),
-		podsFactory:          podsFactory,
-		podLister:            podsInformer.Lister(),
-		podsInformer:         podsInformer.Informer(),
-		restMapper:           restMapper,
-		scaleClient:          scaleClient,
-		dynamicClient:        dynamic,
-		httpClient:           client,
-		logger:               logger,
-		stopCh:               make(chan struct{}),
-		discoveredGroups:     map[string]struct{}{},
+		kubeClient:                kubeClient,
+		namespace:                 namespace,
+		reconcileInterval:         reconcileInterval,
+		removeLastAppliedReplicas: removeLastAppliedReplicas,
+		statefulSetsFactory:       statefulSetsFactory,
+		statefulSetLister:         statefulSetsInformer.Lister(),
+		statefulSetsInformer:      statefulSetsInformer.Informer(),
+		podsFactory:               podsFactory,
+		podLister:                 podsInformer.Lister(),
+		podsInformer:              podsInformer.Informer(),
+		restMapper:                restMapper,
+		scaleClient:               scaleClient,
+		dynamicClient:             dynamic,
+		httpClient:                client,
+		logger:                    logger,
+		stopCh:                    make(chan struct{}),
+		discoveredGroups:          map[string]struct{}{},
 		groupReconcileTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "rollout_operator_group_reconciles_total",
 			Help: "Total number of reconciles started for a specific rollout group.",
@@ -137,6 +144,18 @@ func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTM
 			Name: "rollout_operator_downscale_probe_total",
 			Help: "Total number of downscale probes.",
 		}, []string{"scale_down_pod_name", "status"}),
+		removeLastAppliedReplicaTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "rollout_operator_remove_last_applied_replicas_total",
+			Help: "Total number of removal of .spec.replicas field from last-applied-configuration annotation.",
+		}, []string{"statefulset_name"}),
+		removeLastAppliedReplicaEmptyTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "rollout_operator_remove_last_applied_replicas_empty_total",
+			Help: "Total number of empty .spec.replicas field from last-applied-configuration annotation.",
+		}, []string{"statefulset_name"}),
+		removeLastAppliedReplicaErrorTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "rollout_operator_remove_last_applied_replicas_error_total",
+			Help: "Total number of errors while removing .spec.replicas field from last-applied-configuration annotation.",
+		}, []string{"statefulset_name", "error"}),
 	}
 
 	return c
@@ -266,6 +285,14 @@ func (c *RolloutController) reconcileStatefulSetsGroup(ctx context.Context, grou
 
 	// Sort StatefulSets to provide a deterministic behaviour.
 	util.SortStatefulSets(sets)
+
+	if c.removeLastAppliedReplicas {
+		for _, s := range sets {
+			if err := c.removeReplicasFromLastApplied(ctx, s); err != nil {
+				return errors.Wrapf(err, "failed to remove last-applied-configuration annotation from StatefulSet %s", s.GetName())
+			}
+		}
+	}
 
 	// Adjust the number of replicas for each StatefulSet in the group if desired. If the number of
 	// replicas of any StatefulSet was adjusted, return early in order to guarantee each STS model is
@@ -668,4 +695,104 @@ func (c *RolloutController) patchStatefulSetSpecReplicas(ctx context.Context, st
 	patch := fmt.Sprintf(`{"spec":{"replicas":%d}}`, replicas)
 	_, err := c.kubeClient.AppsV1().StatefulSets(c.namespace).Patch(ctx, sts.GetName(), types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
 	return err
+}
+
+// replicasAbsentLastAppConf returns true if .spec.replicas is NOT present in the last applied configuration
+func replicasAbsentLastAppConf(sts *v1.StatefulSet) (bool, error) {
+	raw, ok := sts.Annotations[lastAppConfAnnKey]
+	if !ok || raw == "" {
+		return true, nil // nothing to check
+	}
+
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+		return false, err
+	}
+	spec, ok := obj["spec"].(map[string]any)
+	if !ok {
+		return true, nil
+	}
+	_, has := spec["replicas"]
+	return !has, nil
+}
+
+// removeReplicasFromLastApplied deletes .spec.replicas from the
+// kubectl.kubernetes.io/last-applied-configuration annotation on a StatefulSet.
+func (c *RolloutController) removeReplicasFromLastApplied(
+	ctx context.Context,
+	sts *v1.StatefulSet,
+) error {
+	const noAnnotationErr = "NoAnnotationErr"
+	const lastAppliedNotFoundErr = "LastAppliedNotFoundErr"
+	const specNotFoundErr = "SpecNotFoundErr"
+	const jsonDecodeErr = "JsonDecodeErr"
+	const jsonEncodeErr = "JsonEncodeErr"
+	const stsPatchErr = "StsPatchErr"
+	const verifyErr = "VerifyErr"
+	const verifyFailed = "VerifyFailed"
+
+	c.removeLastAppliedReplicaTotal.WithLabelValues(sts.GetName()).Inc()
+	anns := sts.GetAnnotations()
+	if anns == nil {
+		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), noAnnotationErr).Inc()
+		return fmt.Errorf("no annotation found on statefulset %s", sts.GetName())
+	}
+	raw, ok := anns[lastAppConfAnnKey]
+	if !ok || raw == "" {
+		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), lastAppliedNotFoundErr).Inc()
+		return fmt.Errorf("last applied annotation not found in statefulset %s annotations", sts.GetName())
+	}
+
+	// Decode annotation JSON.
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), jsonDecodeErr).Inc()
+		return fmt.Errorf("unmarshal %s: %w", lastAppConfAnnKey, err)
+	}
+
+	// Remove spec.replicas.
+	if spec, ok := obj["spec"].(map[string]any); ok {
+		if _, ok := spec["replicas"]; !ok {
+			c.removeLastAppliedReplicaEmptyTotal.WithLabelValues(sts.GetName()).Inc()
+			return nil
+		}
+		delete(spec, "replicas")
+		if len(spec) == 0 {
+			delete(obj, "spec")
+		}
+	} else {
+		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), specNotFoundErr).Inc()
+		return fmt.Errorf("no spec found on statefulset %s last applied annotation", sts.GetName())
+	}
+
+	// Encode updated annotation.
+	newRaw, err := json.Marshal(obj)
+	if err != nil {
+		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), jsonEncodeErr).Inc()
+		return fmt.Errorf("marshal %s: %w", lastAppConfAnnKey, err)
+	}
+
+	// Patch StatefulSet with the new annotation.
+	patch := fmt.Sprintf(
+		`{"metadata":{"annotations":{"%s":%q}}}`,
+		lastAppConfAnnKey,
+		newRaw,
+	)
+	_, err = c.kubeClient.AppsV1().
+		StatefulSets(c.namespace).
+		Patch(ctx, sts.GetName(), types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
+	if err != nil {
+		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), stsPatchErr).Inc()
+		return err
+	}
+	ok, err = replicasAbsentLastAppConf(sts)
+	if err != nil {
+		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), verifyErr).Inc()
+		return fmt.Errorf("verify %s: %w", sts.GetName(), err)
+	}
+	if !ok {
+		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), verifyFailed).Inc()
+		return fmt.Errorf("verify %s: replicas still present in last applied annotation", sts.GetName())
+	}
+	return nil
 }
