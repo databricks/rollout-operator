@@ -80,6 +80,7 @@ type RolloutController struct {
 	removeLastAppliedReplicaEmptyTotal *prometheus.CounterVec
 	removeLastAppliedReplicaErrorTotal *prometheus.CounterVec
 	downscaleState                     *prometheus.GaugeVec
+	lastAppliedReplicasPresent         *prometheus.GaugeVec
 
 	// Keep track of discovered rollout groups. We use this information to delete metrics
 	// related to rollout groups that have been decommissioned.
@@ -158,6 +159,10 @@ func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTM
 		downscaleState: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
 			Name: "rollout_operator_downscale_state",
 			Help: "State of the downscale operation.",
+		}, []string{"statefulset_name"}),
+		lastAppliedReplicasPresent: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
+			Name: "rollout_operator_last_applied_replicas_present",
+			Help: "Whether the last-applied-configuration annotation contains .spec.replicas field.",
 		}, []string{"statefulset_name"}),
 	}
 
@@ -698,25 +703,6 @@ func (c *RolloutController) patchStatefulSetSpecReplicas(ctx context.Context, st
 	return err
 }
 
-// replicasAbsentLastAppConf returns true if .spec.replicas is NOT present in the last applied configuration
-func replicasAbsentLastAppConf(sts *v1.StatefulSet) (bool, error) {
-	raw, ok := sts.Annotations[lastAppConfAnnKey]
-	if !ok || raw == "" {
-		return true, nil // nothing to check
-	}
-
-	var obj map[string]any
-	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
-		return false, err
-	}
-	spec, ok := obj["spec"].(map[string]any)
-	if !ok {
-		return true, nil
-	}
-	_, has := spec["replicas"]
-	return !has, nil
-}
-
 // removeReplicasFromLastApplied deletes .spec.replicas from the
 // kubectl.kubernetes.io/last-applied-configuration annotation on a StatefulSet.
 func (c *RolloutController) removeReplicasFromLastApplied(
@@ -729,8 +715,6 @@ func (c *RolloutController) removeReplicasFromLastApplied(
 	const jsonDecodeErr = "JsonDecodeErr"
 	const jsonEncodeErr = "JsonEncodeErr"
 	const stsPatchErr = "StsPatchErr"
-	const verifyErr = "VerifyErr"
-	const verifyFailed = "VerifyFailed"
 
 	c.removeLastAppliedReplicaTotal.WithLabelValues(sts.GetName()).Inc()
 	anns := sts.GetAnnotations()
@@ -754,9 +738,11 @@ func (c *RolloutController) removeReplicasFromLastApplied(
 	// Remove spec.replicas.
 	if spec, ok := obj["spec"].(map[string]any); ok {
 		if _, ok := spec["replicas"]; !ok {
+			c.lastAppliedReplicasPresent.WithLabelValues(sts.GetName()).Set(0)
 			c.removeLastAppliedReplicaEmptyTotal.WithLabelValues(sts.GetName()).Inc()
 			return nil
 		}
+		c.lastAppliedReplicasPresent.WithLabelValues(sts.GetName()).Set(1)
 		delete(spec, "replicas")
 		if len(spec) == 0 {
 			delete(obj, "spec")
@@ -785,15 +771,6 @@ func (c *RolloutController) removeReplicasFromLastApplied(
 	if err != nil {
 		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), stsPatchErr).Inc()
 		return err
-	}
-	ok, err = replicasAbsentLastAppConf(sts)
-	if err != nil {
-		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), verifyErr).Inc()
-		return fmt.Errorf("verify %s: %w", sts.GetName(), err)
-	}
-	if !ok {
-		c.removeLastAppliedReplicaErrorTotal.WithLabelValues(sts.GetName(), verifyFailed).Inc()
-		return fmt.Errorf("verify %s: replicas still present in last applied annotation", sts.GetName())
 	}
 	return nil
 }
