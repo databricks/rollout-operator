@@ -289,7 +289,7 @@ func (c *RolloutController) reconcileStatefulSetsGroup(ctx context.Context, grou
 	if c.removeLastAppliedReplicas {
 		for _, s := range sets {
 			if err := c.removeReplicasFromLastApplied(ctx, s); err != nil {
-				return errors.Wrapf(err, "failed to remove last-applied-configuration annotation from StatefulSet %s", s.GetName())
+				level.Error(c.logger).Log("msg", "failed to remove replicas from last-applied-configuration annotation", "statefulset", s.Name, "err", err)
 			}
 		}
 	}
