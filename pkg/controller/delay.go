@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"time"
 
@@ -44,7 +45,7 @@ func cancelDelayedDownscaleIfConfigured(ctx context.Context, logger log.Logger, 
 	callCancelDelayedDownscale(ctx, logger, httpClient, endpoints)
 }
 
-func checkScalingBoolean(ctx context.Context, logger log.Logger, sts *v1.StatefulSet, httpClient httpClient, currentReplicas, desiredReplicas int32, scaleDownBooleanMetric *prometheus.GaugeVec, downscaleProbeTotal *prometheus.CounterVec, downscaleProbeFailureTotal *prometheus.CounterVec) (updatedDesiredReplicas int32, _ error) {
+func checkScalingBoolean(ctx context.Context, logger log.Logger, sts *v1.StatefulSet, httpClient httpClient, currentReplicas, desiredReplicas int32, downscaleProbeTotal *prometheus.CounterVec) (updatedDesiredReplicas int32, _ error) {
 	if desiredReplicas >= currentReplicas {
 		return desiredReplicas, nil
 	}
@@ -54,7 +55,7 @@ func checkScalingBoolean(ctx context.Context, logger log.Logger, sts *v1.Statefu
 		return currentReplicas, err
 	}
 	downscaleEndpoints := createPrepareDownscaleEndpoints(sts.Namespace, sts.GetName(), getStsSvcName(sts), int(desiredReplicas), int(currentReplicas), prepareURL)
-	scalableBooleans, err := callPerpareDownscaleAndReturnScalable(ctx, logger, httpClient, downscaleEndpoints, scaleDownBooleanMetric, downscaleProbeTotal, downscaleProbeFailureTotal)
+	scalableBooleans, err := callPerpareDownscaleAndReturnScalable(ctx, logger, httpClient, downscaleEndpoints, downscaleProbeTotal)
 	if err != nil {
 		return currentReplicas, fmt.Errorf("failed prepare pods for delayed downscale: %v", err)
 	}
@@ -160,7 +161,7 @@ func parseDelayedDownscaleAnnotations(annotations map[string]string) (time.Durat
 	delayStr := annotations[config.RolloutDelayedDownscaleAnnotationKey]
 	urlStr := annotations[config.RolloutDelayedDownscalePrepareUrlAnnotationKey]
 
-	if delayStr == "" || urlStr == "" {
+	if delayStr == "" || delayStr == "boolean" || urlStr == "" {
 		return 0, nil, nil
 	}
 
@@ -218,7 +219,7 @@ func createPrepareDownscaleEndpoints(namespace, statefulsetName, serviceName str
 	return eps
 }
 
-func callPerpareDownscaleAndReturnScalable(ctx context.Context, logger log.Logger, client httpClient, endpoints []endpoint, scaleDownBooleanMetric *prometheus.GaugeVec, downscaleProbeTotal *prometheus.CounterVec, downscaleProbeFailureTotal *prometheus.CounterVec) (map[int]bool, error) {
+func callPerpareDownscaleAndReturnScalable(ctx context.Context, logger log.Logger, client httpClient, endpoints []endpoint, downscaleProbeTotal *prometheus.CounterVec) (map[int]bool, error) {
 	if len(endpoints) == 0 {
 		return nil, fmt.Errorf("no endpoints")
 	}
@@ -238,33 +239,31 @@ func callPerpareDownscaleAndReturnScalable(ctx context.Context, logger log.Logge
 			epLogger := log.With(logger, "pod", ep.podName, "url", target)
 
 			req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, nil)
-			downscaleProbeTotal.WithLabelValues(ep.podName).Inc()
 			if err != nil {
 				level.Error(epLogger).Log("msg", "error creating HTTP POST request to endpoint", "err", err)
-				downscaleProbeFailureTotal.WithLabelValues(ep.podName).Inc()
+				downscaleProbeTotal.WithLabelValues(ep.podName, "error creating HTTP POST request to endpoint").Inc()
 				return err
 			}
 
 			resp, err := client.Do(req)
 			if err != nil {
 				level.Error(epLogger).Log("msg", "error sending HTTP POST request to endpoint", "err", err)
+				downscaleProbeTotal.WithLabelValues(ep.podName, "error sending HTTP POST request to endpoint").Inc()
 				return err
 			}
 
 			defer resp.Body.Close()
 
 			scalableMu.Lock()
+			downscaleProbeTotal.WithLabelValues(ep.podName, strconv.Itoa(resp.StatusCode)).Inc()
 			if resp.StatusCode == 200 {
 				scalable[ep.replica] = true
-				scaleDownBooleanMetric.WithLabelValues(ep.podName).Set(1)
 			} else {
 				if resp.StatusCode != 425 {
 					// 425 too early
-					downscaleProbeFailureTotal.WithLabelValues(ep.podName).Inc()
 					level.Error(epLogger).Log("msg", "downscale POST got unexpected status", resp.StatusCode)
 				}
 				scalable[ep.replica] = false
-				scaleDownBooleanMetric.WithLabelValues(ep.podName).Set(0)
 			}
 			scalableMu.Unlock()
 

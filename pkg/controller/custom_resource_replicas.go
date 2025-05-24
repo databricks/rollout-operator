@@ -19,6 +19,11 @@ import (
 	"github.com/grafana/rollout-operator/pkg/config"
 )
 
+const (
+	idle = iota
+	waiting
+)
+
 func (c *RolloutController) adjustStatefulSetsGroupReplicasToMirrorResource(ctx context.Context, groupName string, sets []*appsv1.StatefulSet, client httpClient) (bool, error) {
 	// Return early no matter what after scaling up or down a single StatefulSet to make sure that rollout-operator
 	// works with up-to-date models.
@@ -50,16 +55,16 @@ func (c *RolloutController) adjustStatefulSetsGroupReplicasToMirrorResource(ctx 
 		var desiredReplicas int32
 		if sts.GetAnnotations()[config.RolloutDelayedDownscaleAnnotationKey] == "boolean" {
 			level.Debug(c.logger).Log("msg", "boolean scaling logic")
-			desiredReplicas, err = checkScalingBoolean(ctx, c.logger, sts, client, currentReplicas, referenceResourceDesiredReplicas, c.scaleDownBoolean, c.downscaleProbeTotal, c.downscaleProbeFailureTotal)
+			desiredReplicas, err = checkScalingBoolean(ctx, c.logger, sts, client, currentReplicas, referenceResourceDesiredReplicas, c.downscaleProbeTotal)
 		} else {
 			desiredReplicas, err = checkScalingDelay(ctx, c.logger, sts, client, currentReplicas, referenceResourceDesiredReplicas)
 		}
 		if err != nil {
-			level.Warn(c.logger).Log("msg", "not scaling statefulset due to failed scaling delay check",
+			level.Info(c.logger).Log("msg", "not scaling statefulset due to failed scaling delay check",
 				"group", groupName,
 				"name", sts.GetName(),
 				"currentReplicas", currentReplicas,
-				"referenceResourceDesiredReplicas", referenceResourceDesiredReplicas,
+				"desiredReplicas", referenceResourceDesiredReplicas,
 				"err", err,
 			)
 
@@ -69,6 +74,11 @@ func (c *RolloutController) adjustStatefulSetsGroupReplicasToMirrorResource(ctx 
 		}
 
 		logMsg := ""
+		if desiredReplicas == referenceResourceDesiredReplicas {
+			c.downscaleState.WithLabelValues(sts.GetName()).Set(float64(idle))
+		} else {
+			c.downscaleState.WithLabelValues(sts.GetName()).Set(float64(waiting))
+		}
 		if desiredReplicas > currentReplicas {
 			logMsg = "scaling up statefulset to match replicas in the reference resource"
 		} else if desiredReplicas < currentReplicas {
