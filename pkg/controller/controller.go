@@ -51,6 +51,7 @@ type RolloutController struct {
 	kubeClient           kubernetes.Interface
 	namespace            string
 	reconcileInterval    time.Duration
+	oomCooldown          time.Duration
 	statefulSetsFactory  informers.SharedInformerFactory
 	statefulSetLister    listersv1.StatefulSetLister
 	statefulSetsInformer cache.SharedIndexInformer
@@ -80,6 +81,7 @@ type RolloutController struct {
 	removeLastAppliedReplicasEmptyTotal *prometheus.CounterVec
 	removeLastAppliedReplicasErrorTotal *prometheus.CounterVec
 	lastAppliedReplicasRemovedTotal     *prometheus.CounterVec
+	oomDetectedTotal                    *prometheus.CounterVec
 	downscaleState                      *prometheus.GaugeVec
 
 	// Keep track of discovered rollout groups. We use this information to delete metrics
@@ -87,7 +89,7 @@ type RolloutController struct {
 	discoveredGroups map[string]struct{}
 }
 
-func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTMapper, scaleClient scale.ScalesGetter, dynamic dynamic.Interface, namespace string, client httpClient, reconcileInterval time.Duration, reg prometheus.Registerer, logger log.Logger) *RolloutController {
+func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTMapper, scaleClient scale.ScalesGetter, dynamic dynamic.Interface, namespace string, client httpClient, reconcileInterval time.Duration, oomCooldown time.Duration, reg prometheus.Registerer, logger log.Logger) *RolloutController {
 	namespaceOpt := informers.WithNamespace(namespace)
 
 	// Initialise the StatefulSet informer to restrict the returned StatefulSets to only the ones
@@ -106,6 +108,7 @@ func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTM
 		kubeClient:           kubeClient,
 		namespace:            namespace,
 		reconcileInterval:    reconcileInterval,
+		oomCooldown:          oomCooldown,
 		statefulSetsFactory:  statefulSetsFactory,
 		statefulSetLister:    statefulSetsInformer.Lister(),
 		statefulSetsInformer: statefulSetsInformer.Informer(),
@@ -159,6 +162,10 @@ func NewRolloutController(kubeClient kubernetes.Interface, restMapper meta.RESTM
 		lastAppliedReplicasRemovedTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "rollout_operator_last_applied_replicas_removed_total",
 			Help: "Total number of .spec.replicas fields removed from last-applied-configuration annotation.",
+		}, []string{"statefulset_name"}),
+		oomDetectedTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "rollout_operator_oom_detected_total",
+			Help: "Total number of OOM killed pods detected in a StatefulSet.",
 		}, []string{"statefulset_name"}),
 		downscaleState: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
 			Name: "rollout_operator_downscale_state",
@@ -481,6 +488,12 @@ func (c *RolloutController) hasStatefulSetNotReadyPods(sts *v1.StatefulSet) (boo
 		return true, nil
 	}
 
+	if hasRecentlyOOMKilled(c.oomCooldown, pods) {
+		level.Warn(c.logger).Log("msg", "OOM killed pods detected", "statefulset", sts.Name, "oomCooldown", c.oomCooldown)
+		c.oomDetectedTotal.WithLabelValues(sts.Name).Inc()
+		return true, nil
+	}
+
 	// The number of ready replicas reported by the StatefulSet matches the total number of
 	// replicas. However, there's still no guarantee that all pods are running. For example,
 	// a terminating pod (which we don't consider "ready") may have not yet failed the
@@ -527,6 +540,27 @@ func notRunningAndReady(pods []*corev1.Pod) []*corev1.Pod {
 	// Sort pods in order to provide a deterministic behaviour.
 	util.SortPods(notReady)
 	return notReady
+}
+
+func hasRecentlyOOMKilled(cooldown time.Duration, pods []*corev1.Pod) bool {
+	if cooldown == 0 {
+		// feature is disabled
+		return false
+	}
+
+	// if oom kill happens within cooldown period, then return true else ignore old oom kills
+	oomCooldownTime := time.Now().Add(-cooldown)
+	for _, pod := range pods {
+		for _, cs := range pod.Status.ContainerStatuses {
+			term := cs.LastTerminationState.Terminated
+			if cs.RestartCount > 0 && term != nil {
+				if term.ExitCode == 137 && term.FinishedAt.Time.After(oomCooldownTime) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // listPods returns pods matching the provided labels selector. Please remember to call
