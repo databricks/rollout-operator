@@ -46,6 +46,7 @@ type config struct {
 	kubeConfigFile    string
 	kubeNamespace     string
 	reconcileInterval time.Duration
+	oomCooldown       time.Duration
 
 	serverTLSEnabled bool
 	serverTLSPort    int
@@ -71,6 +72,7 @@ func (cfg *config) register(fs *flag.FlagSet) {
 	fs.StringVar(&cfg.kubeConfigFile, "kubernetes.config-file", "", "The Kubernetes config file path. If not specified, it will be auto-detected when running within a Kubernetes cluster.")
 	fs.StringVar(&cfg.kubeNamespace, "kubernetes.namespace", "", "The Kubernetes namespace for which this operator is running.")
 	fs.DurationVar(&cfg.reconcileInterval, "reconcile.interval", 5*time.Second, "The minimum interval of reconciliation.")
+	fs.DurationVar(&cfg.oomCooldown, "oom.cooldown", 0*time.Minute, "If pods oom killed within cooldown duration, then don't proceed the rollout, 0 means disabled.")
 
 	fs.BoolVar(&cfg.serverTLSEnabled, "server-tls.enabled", false, "Enable TLS server for webhook connections.")
 	fs.IntVar(&cfg.serverTLSPort, "server-tls.port", 8443, "Port to use for exposing TLS server for webhook connections (if enabled).")
@@ -171,7 +173,7 @@ func main() {
 	maybeStartTLSServer(cfg, logger, kubeClient, restart, metrics)
 
 	// Init the controller.
-	c := controller.NewRolloutController(kubeClient, restMapper, scaleClient, dynamicClient, cfg.kubeNamespace, httpClient, cfg.reconcileInterval, reg, logger)
+	c := controller.NewRolloutController(kubeClient, restMapper, scaleClient, dynamicClient, cfg.kubeNamespace, httpClient, cfg.reconcileInterval, cfg.oomCooldown, reg, logger)
 	check(errors.Wrap(c.Init(), "failed to init controller"))
 
 	// Listen to sigterm, as well as for restart (like for certificate renewal).
