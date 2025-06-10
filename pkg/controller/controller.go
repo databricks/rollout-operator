@@ -488,8 +488,8 @@ func (c *RolloutController) hasStatefulSetNotReadyPods(sts *v1.StatefulSet) (boo
 		return true, nil
 	}
 
-	if hasRecentlyOOMKilled(c.oomCooldown, pods) {
-		level.Warn(c.logger).Log("msg", "OOM killed pods detected", "statefulset", sts.Name, "oomCooldown", c.oomCooldown)
+	if oomKilledPod := hasRecentlyOOMKilled(c.oomCooldown, pods); oomKilledPod != nil {
+		level.Warn(c.logger).Log("msg", "OOM killed pods detected", "statefulset", sts.Name, "oomCooldown", c.oomCooldown, "pod", oomKilledPod.Name)
 		c.oomDetectedTotal.WithLabelValues(sts.Name).Inc()
 		return true, nil
 	}
@@ -542,10 +542,10 @@ func notRunningAndReady(pods []*corev1.Pod) []*corev1.Pod {
 	return notReady
 }
 
-func hasRecentlyOOMKilled(cooldown time.Duration, pods []*corev1.Pod) bool {
+func hasRecentlyOOMKilled(cooldown time.Duration, pods []*corev1.Pod) *corev1.Pod {
 	if cooldown == 0 {
 		// feature is disabled
-		return false
+		return nil
 	}
 
 	// if oom kill happens within cooldown period, then return true else ignore old oom kills
@@ -555,12 +555,12 @@ func hasRecentlyOOMKilled(cooldown time.Duration, pods []*corev1.Pod) bool {
 			term := cs.LastTerminationState.Terminated
 			if cs.RestartCount > 0 && term != nil {
 				if term.ExitCode == 137 && term.FinishedAt.Time.After(oomCooldownTime) {
-					return true
+					return pod
 				}
 			}
 		}
 	}
-	return false
+	return nil
 }
 
 // listPods returns pods matching the provided labels selector. Please remember to call
