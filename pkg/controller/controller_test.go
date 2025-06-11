@@ -1465,9 +1465,9 @@ func withOomKill(recency time.Duration) func(pod *corev1.Pod) {
 				RestartCount: 1,
 				LastTerminationState: corev1.ContainerState{
 					Terminated: &corev1.ContainerStateTerminated{
-						ExitCode:   137, // 137 is the exit code for OOMKilled.
-						Reason:     "OOMKilled",
-						FinishedAt: metav1.NewTime(time.Now().Add(-recency)),
+						ExitCode:  OOMExitCode,
+						Reason:    "OOMKilled",
+						StartedAt: metav1.NewTime(time.Now().Add(-recency)),
 					},
 				},
 			},

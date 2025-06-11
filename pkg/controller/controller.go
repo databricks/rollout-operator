@@ -41,6 +41,10 @@ const (
 	// the operator reconciles even if no changes are made to the watched resources.
 	informerSyncInterval = 5 * time.Minute
 	lastAppConfAnnKey    = "kubectl.kubernetes.io/last-applied-configuration"
+	// OOMExitCode 137 is the exit code for OOM killed processes in Linux (128 + 9 for SIGNAL_KILL).
+	// see https://tldp.org/LDP/abs/html/exitcodes.html
+	// or https://discuss.kubernetes.io/t/how-can-we-tell-if-the-oomkilled-in-k8s-is-because-the-node-is-running-out-of-memory-and-thus-killing-the-pod-or-if-the-pod-itself-is-being-killed-because-the-memory-it-has-requested-exceeds-the-limt-declaration-limit/26303
+	OOMExitCode = 137
 )
 
 type httpClient interface {
@@ -554,7 +558,7 @@ func hasRecentlyOOMKilled(cooldown time.Duration, pods []*corev1.Pod) *corev1.Po
 		for _, cs := range pod.Status.ContainerStatuses {
 			term := cs.LastTerminationState.Terminated
 			if cs.RestartCount > 0 && term != nil {
-				if term.ExitCode == 137 && term.FinishedAt.Time.After(oomCooldownTime) {
+				if term.ExitCode == OOMExitCode && term.StartedAt.Time.After(oomCooldownTime) {
 					return pod
 				}
 			}
