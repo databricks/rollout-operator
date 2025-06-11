@@ -42,6 +42,11 @@ const (
 	testLastRevisionHash = "last-hash"
 )
 
+// uncomment the line below to enable debug logging
+var logger = log.NewNopLogger()
+
+//var logger = log.NewLogfmtLogger(os.Stdout)
+
 func TestRolloutController_Reconcile(t *testing.T) {
 	customResourceGVK := schema.GroupVersionKind{Group: "my.group", Version: "v1", Kind: "CustomResource"}
 
@@ -50,6 +55,7 @@ func TestRolloutController_Reconcile(t *testing.T) {
 		pods                              []runtime.Object
 		customResourceScaleSpecReplicas   int
 		customResourceScaleStatusReplicas int
+		oomCooldown                       time.Duration
 		kubePatchErr                      error
 		kubeDeleteErr                     error
 		kubeUpdateErr                     error
@@ -567,6 +573,61 @@ func TestRolloutController_Reconcile(t *testing.T) {
 			expectedPatchedSets:               map[string][]string{"ingester-zone-d": {`{"spec":{"replicas":5}}`}},
 			expectedPatchedResources:          map[string][]string{"my.group/v1/customresources/test/status": {`{"status":{"replicas":5}}`}},
 		},
+		"should NOT rollout if pods were oom killed recently": {
+			oomCooldown: time.Hour,
+			statefulSets: []runtime.Object{
+				mockStatefulSet("ingester-zone-a", withReplicas(2, 2)),
+				mockStatefulSet("ingester-zone-b", withReplicas(2, 2), withPrevRevision()),
+			},
+			pods: []runtime.Object{
+				mockStatefulSetPod("ingester-zone-a-0", testLastRevisionHash, withOomKill(10*time.Minute)),
+				mockStatefulSetPod("ingester-zone-a-1", testLastRevisionHash),
+				mockStatefulSetPod("ingester-zone-b-0", testPrevRevisionHash),
+				mockStatefulSetPod("ingester-zone-b-1", testPrevRevisionHash),
+			},
+		},
+		"should rollout if pods were oom killed long time ago": {
+			oomCooldown: time.Hour,
+			statefulSets: []runtime.Object{
+				mockStatefulSet("ingester-zone-a", withReplicas(2, 2)),
+				mockStatefulSet("ingester-zone-b", withReplicas(2, 2), withPrevRevision()),
+			},
+			pods: []runtime.Object{
+				mockStatefulSetPod("ingester-zone-a-0", testLastRevisionHash, withOomKill(2*time.Hour)),
+				mockStatefulSetPod("ingester-zone-a-1", testLastRevisionHash),
+				mockStatefulSetPod("ingester-zone-b-0", testLastRevisionHash),
+				mockStatefulSetPod("ingester-zone-b-1", testPrevRevisionHash),
+			},
+			expectedDeletedPods: []string{"ingester-zone-b-1"},
+		},
+		"should rollout if pods were oom killed for the same statefulset": {
+			oomCooldown: time.Hour,
+			statefulSets: []runtime.Object{
+				mockStatefulSet("ingester-zone-a", withReplicas(2, 2)),
+				mockStatefulSet("ingester-zone-b", withReplicas(2, 2), withPrevRevision()),
+			},
+			pods: []runtime.Object{
+				mockStatefulSetPod("ingester-zone-a-0", testLastRevisionHash),
+				mockStatefulSetPod("ingester-zone-a-1", testLastRevisionHash),
+				mockStatefulSetPod("ingester-zone-b-0", testLastRevisionHash, withOomKill(2*time.Minute)),
+				mockStatefulSetPod("ingester-zone-b-1", testPrevRevisionHash),
+			},
+			expectedDeletedPods: []string{"ingester-zone-b-1"},
+		},
+		"should rollout if to update pods were oom killed": {
+			oomCooldown: time.Hour,
+			statefulSets: []runtime.Object{
+				mockStatefulSet("ingester-zone-a", withReplicas(2, 2)),
+				mockStatefulSet("ingester-zone-b", withReplicas(2, 2), withPrevRevision()),
+			},
+			pods: []runtime.Object{
+				mockStatefulSetPod("ingester-zone-a-0", testLastRevisionHash),
+				mockStatefulSetPod("ingester-zone-a-1", testLastRevisionHash),
+				mockStatefulSetPod("ingester-zone-b-0", testPrevRevisionHash, withOomKill(2*time.Minute)),
+				mockStatefulSetPod("ingester-zone-b-1", testPrevRevisionHash),
+			},
+			expectedDeletedPods: []string{"ingester-zone-b-0", "ingester-zone-b-1"},
+		},
 	}
 
 	for testName, testData := range tests {
@@ -618,7 +679,7 @@ func TestRolloutController_Reconcile(t *testing.T) {
 
 			// Create the controller and start informers.
 			reg := prometheus.NewPedanticRegistry()
-			c := NewRolloutController(kubeClient, restMapper, scaleClient, dynamicClient, testNamespace, nil, 0, reg, log.NewNopLogger())
+			c := NewRolloutController(kubeClient, restMapper, scaleClient, dynamicClient, testNamespace, nil, 0, time.Hour, reg, logger)
 			require.NoError(t, c.Init())
 			defer c.Stop()
 
@@ -855,7 +916,7 @@ func TestRolloutController_ReconcileStatefulsetWithDownscaleBoolean(t *testing.T
 
 			// Create the controller and start informers.
 			reg := prometheus.NewPedanticRegistry()
-			c := NewRolloutController(kubeClient, restMapper, scaleClient, dynamicClient, testNamespace, httpClient, 0, reg, log.NewNopLogger())
+			c := NewRolloutController(kubeClient, restMapper, scaleClient, dynamicClient, testNamespace, httpClient, 0, 0, reg, logger)
 			require.NoError(t, c.Init())
 			defer c.Stop()
 
@@ -1128,7 +1189,7 @@ func TestRolloutController_ReconcileStatefulsetWithDownscaleDelay(t *testing.T) 
 
 			// Create the controller and start informers.
 			reg := prometheus.NewPedanticRegistry()
-			c := NewRolloutController(kubeClient, restMapper, scaleClient, dynamicClient, testNamespace, httpClient, 0, reg, log.NewNopLogger())
+			c := NewRolloutController(kubeClient, restMapper, scaleClient, dynamicClient, testNamespace, httpClient, 0, 0, reg, logger)
 			require.NoError(t, c.Init())
 			defer c.Stop()
 
@@ -1231,7 +1292,7 @@ func TestRolloutController_ReconcileShouldDeleteMetricsForDecommissionedRolloutG
 
 	// Create the controller and start informers.
 	reg := prometheus.NewPedanticRegistry()
-	c := NewRolloutController(kubeClient, nil, nil, nil, testNamespace, nil, 0, reg, log.NewNopLogger())
+	c := NewRolloutController(kubeClient, nil, nil, nil, testNamespace, nil, 0, 0, reg, logger)
 	require.NoError(t, c.Init())
 	defer c.Stop()
 
@@ -1392,6 +1453,25 @@ func withAnnotations(annotations map[string]string) func(sts *v1.StatefulSet) {
 			existing[k] = v
 		}
 		sts.SetAnnotations(existing)
+	}
+}
+
+func withOomKill(recency time.Duration) func(pod *corev1.Pod) {
+	return func(pod *corev1.Pod) {
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+			{
+				Ready:        true,
+				State:        corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+				RestartCount: 1,
+				LastTerminationState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode:  OOMExitCode,
+						Reason:    "OOMKilled",
+						StartedAt: metav1.NewTime(time.Now().Add(-recency)),
+					},
+				},
+			},
+		}
 	}
 }
 
