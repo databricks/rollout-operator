@@ -1,0 +1,32 @@
+{
+    "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+    "extends": [
+        "config:recommended",
+        "helpers:pinGitHubActionDigests",
+        "schedule:weekly"
+    ],
+    "postUpdateOptions": [
+        "gomodTidy"
+    ],
+    "branchPrefix": "grafanarenovatebot/",
+    "platformCommit": true,
+    "dependencyDashboard": false,
+    "rebaseWhen": "behind-base-branch",
+    "packageRules": [
+         {
+             "description": "Group all go dependencies together to reduce noise",
+             "matchDatasources": ["go"],
+             "groupName": "go dependencies"
+         },
+         {
+             "description": "Disable Docker updates",
+             "matchManagers": ["dockerfile"],
+             "enabled": false
+         }
+     ],
+     "separateMajorMinor": false,
+     "vulnerabilityAlerts": {
+         "enabled": true
+     },
+    "osvVulnerabilityAlerts": true
+}
