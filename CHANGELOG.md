@@ -2,6 +2,88 @@
 
 ## main / unreleased
 
+* [CHANGE] Rename flag `server.cluster-validation.http.exclude-paths` to `server.cluster-validation.http.excluded-paths` to align with `dskit`. #247
+* [ENHANCEMENT] Updated dependencies, including: #236 #238 #242 #247
+  * `github.com/prometheus/common` from `v0.64.0` to `v0.65.0`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace` from `v0.60.0` to `v0.62.0`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` from `v0.60.0` to `v0.62.0`
+  * `go.opentelemetry.io/otel` from `v1.36.0` to `v1.37.0`
+  * `go.opentelemetry.io/otel/trace` from `v1.36.0` to `v1.37.0`
+  * `golang.org/x/sync` from `v0.15.0` to `v0.16.0`
+  * `k8s.io/api` from `v0.33.1` to `v0.33.3`
+  * `k8s.io/apimachinery` from `v0.33.1` to `v0.33.3`
+  * `k8s.io/client-go` from `v0.33.1` to `v0.33.3`
+* [BUGFIX] Always configure HTTP client with a timeout. #240
+
+## v0.28.0
+
+* [ENHANCEMENT] Updated dependencies, including: #227 #231
+  * `golang.org/x/sync` from `v0.14.0` to `v0.15.0`
+  * `sigs.k8s.io/controller-runtime` from `v0.20.4` to `v0.21.0`
+* [ENHANCEMENT] Migrate to OpenTelemetry tracing library, removing the dependency on OpenTracing. You can now configure tracing using the standard `OTEL_` [environment variables](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/#batch-span-processor). Previous configurations using `JAEGER_` environment variables will still work, but are deprecated. #234
+
+## v0.27.0
+
+* [CHANGE] Rename metric `rollout_operator_request_invalid_cluster_validation_labels_total` to `rollout_operator_client_invalid_cluster_validation_label_requests_total`. #217
+* [ENHANCEMENT] Add metric `rollout_operator_server_invalid_cluster_validation_label_requests_total`. #223
+* [ENHANCEMENT] Updated dependencies, including: #223 #224
+  * `github.com/prometheus/client_golang` from `v1.21.1` to `v1.22.0`
+  * `github.com/prometheus/common` from `v0.63.0` to `v0.64.0`
+  * `golang.org/x/sync` from `v0.12.0` to `v0.14.0`
+  * `k8s.io/api` from `v0.32.3` to `v0.33.1`
+  * `k8s.io/apimachinery` from `v0.32.3` to `v0.33.1`
+  * `k8s.io/client-go` from `v0.32.3` to `v0.33.1`
+* [BUGFIX] Use a StatefulSet's `.spec.serviceName` when constructing the prepare-downscale endpoint for a pod. #221
+
+## v0.26.0
+
+* [FEATURE] Add cross-cluster traffic protection. #195b
+  * Controlled through the flags `-server.cluster-validation.http.enabled`, `-server.cluster-validation.http.soft-validation`, `-server.cluster-validation.http.exclude-paths`.
+  * Rejected requests can be monitored via the metric `rollout_operator_request_invalid_cluster_validation_labels_total`.
+
+## v0.25.0
+
+* [ENHANCEMENT] Updated dependencies, including: #203
+  * `github.com/prometheus/client_golang` from `v1.20.5` to `v1.21.1`
+  * `github.com/prometheus/common` from `v0.62.0` to `v0.63.0`
+  * `golang.org/x/sync` from `v0.11.0` to `v0.12.0`
+  * `k8s.io/api` from `v0.32.1` to `v0.32.3`
+  * `k8s.io/apimachinery` from `v0.32.1` to `v0.32.3`
+  * `k8s.io/client-go` from `v0.32.1` to `v0.32.3`
+  * `sigs.k8s.io/controller-runtime` from `v0.20.1` to `v0.20.4`
+
+## v0.24.0
+
+* [ENHANCEMENT] Update Go to `1.24` #196
+* [ENHANCEMENT] Updated dependencies, including: #197
+  * `github.com/prometheus/common` from `v0.61.0` to `v0.62.0`
+  * `golang.org/x/sync` from `v0.10.0` to `v0.11.0`
+  * `k8s.io/api` from `v0.32.0` to `v0.32.1`
+  * `k8s.io/apimachinery` from `v0.32.0` to `v0.32.1`
+  * `k8s.io/client-go` from `v0.32.0` to `v0.32.1`
+  * `sigs.k8s.io/controller-runtime` from `v0.19.3` to `v0.20.1`
+
+## v0.23.0
+
+* [ENHANCEMENT] Make timeout for requests to Pods and to the Kubernetes control plane configurable. #188
+* [ENHANCEMENT] Updated dependencies, including: #189 #191
+  * `github.com/prometheus/client_golang` from `v1.20.4` to `v1.20.5`
+  * `github.com/prometheus/common` from `v0.59.1` to `v0.61.0`
+  * `k8s.io/api` from `v0.31.1` to `v0.32.0`
+  * `k8s.io/apimachinery` from `v0.31.1` to `v0.32.0`
+  * `k8s.io/client-go` from `v0.31.1` to `v0.32.0`
+  * `sigs.k8s.io/controller-runtime` from `v0.19.0` to `v0.19.3`
+  * `golang.org/x/net` from `v0.28.0` to `v0.33.0`
+
+## v0.22.0
+
+* [ENHANCEMENT] New parameter log.format allows to set logging format to logfmt (default) or json (new). #184
+* [ENHANCEMENT] Add a 5 minute timeout to requests to Pods and to the Kubernetes control plane. #186
+ 
+## v0.21.0
+
+* [ENHANCEMENT] Log debug information about StatefulSets as they are created, updated and deleted. #182
+
 ## v0.20.1
 
 * [BUGFIX] Improved handling of URL ports in `createPrepareDownscaleEndpoints` function. The function now correctly preserves the port when replacing the host in the URL. #176

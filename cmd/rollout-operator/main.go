@@ -15,6 +15,8 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/clusterutil"
+	"github.com/grafana/dskit/middleware"
 	"github.com/grafana/dskit/tracing"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -38,15 +40,22 @@ import (
 
 const defaultServerSelfSignedCertExpiration = model.Duration(365 * 24 * time.Hour)
 
-type config struct {
-	logLevel string
+var (
+	defaultClusterValidationExcludePaths = []string{"admission/no-downscale", "admission/prepare-downscale"}
+)
 
-	serverPort        int
-	kubeAPIURL        string
-	kubeConfigFile    string
-	kubeNamespace     string
-	reconcileInterval time.Duration
-	oomCooldown       time.Duration
+type config struct {
+	logFormat string
+	logLevel  string
+
+	serverPort           int
+	kubeAPIURL           string
+	kubeConfigFile       string
+	kubeNamespace        string
+	oomCooldown          time.Duration
+	kubeClientTimeout    time.Duration
+	reconcileInterval    time.Duration
+	clusterValidationCfg clusterutil.ClusterValidationProtocolConfigForHTTP
 
 	serverTLSEnabled bool
 	serverTLSPort    int
@@ -66,13 +75,16 @@ type config struct {
 }
 
 func (cfg *config) register(fs *flag.FlagSet) {
+	fs.StringVar(&cfg.logFormat, "log.format", "logfmt", "The log format. Supported values: logfmt, json. Defaults to logfmt.")
 	fs.StringVar(&cfg.logLevel, "log.level", "debug", "The log level. Supported values: debug, info, warn, error.")
 	fs.IntVar(&cfg.serverPort, "server.port", 8001, "Port to use for exposing instrumentation and readiness probe endpoints.")
 	fs.StringVar(&cfg.kubeAPIURL, "kubernetes.api-url", "", "The Kubernetes server API URL. If not specified, it will be auto-detected when running within a Kubernetes cluster.")
 	fs.StringVar(&cfg.kubeConfigFile, "kubernetes.config-file", "", "The Kubernetes config file path. If not specified, it will be auto-detected when running within a Kubernetes cluster.")
+	fs.DurationVar(&cfg.kubeClientTimeout, "kubernetes.client-timeout", 5*time.Minute, "HTTP client timeout. This applies to requests issued to both the Kubernetes API and Kubernetes resource endpoints.")
 	fs.StringVar(&cfg.kubeNamespace, "kubernetes.namespace", "", "The Kubernetes namespace for which this operator is running.")
 	fs.DurationVar(&cfg.reconcileInterval, "reconcile.interval", 5*time.Second, "The minimum interval of reconciliation.")
 	fs.DurationVar(&cfg.oomCooldown, "oom.cooldown", 0*time.Minute, "If pods oom killed within cooldown duration, then don't proceed the rollout, 0 means disabled.")
+	cfg.clusterValidationCfg.RegisterFlagsWithPrefix("server.cluster-validation.http.", fs)
 
 	fs.BoolVar(&cfg.serverTLSEnabled, "server-tls.enabled", false, "Enable TLS server for webhook connections.")
 	fs.IntVar(&cfg.serverTLSPort, "server-tls.port", 8443, "Port to use for exposing TLS server for webhook connections (if enabled).")
@@ -103,6 +115,9 @@ func (cfg config) validate() error {
 	if cfg.useZoneTracker && cfg.zoneTrackerConfigMapName == "" {
 		return errors.New("the zone tracker ConfigMap name has not been specified")
 	}
+	if err := cfg.clusterValidationCfg.Validate("http", cfg.kubeNamespace); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -113,9 +128,13 @@ func main() {
 	fs := flag.NewFlagSet("rollout-operator", flag.ExitOnError)
 	cfg.register(fs)
 	check(fs.Parse(os.Args[1:]))
+	if len(cfg.clusterValidationCfg.ExcludedPaths) == 0 {
+		// Apply default.
+		cfg.clusterValidationCfg.ExcludedPaths = defaultClusterValidationExcludePaths
+	}
 	check(cfg.validate())
 
-	logger, err := initLogger(cfg.logLevel)
+	logger, err := initLogger(cfg.logFormat, cfg.logLevel)
 	check(err)
 
 	reg := prometheus.NewRegistry()
@@ -123,19 +142,23 @@ func main() {
 	ready := atomic.NewBool(false)
 	restart := make(chan string)
 
-	name := os.Getenv("JAEGER_SERVICE_NAME")
-	if name == "" {
+	var name string
+	if otelEnvName := os.Getenv("OTEL_SERVICE_NAME"); otelEnvName != "" {
+		name = otelEnvName
+	} else if jaegerEnvName := os.Getenv("JAEGER_SERVICE_NAME"); jaegerEnvName != "" {
+		name = jaegerEnvName
+	} else {
 		name = "rollout-operator"
 	}
 
-	if trace, err := tracing.NewFromEnv(name); err != nil {
+	trace, err := tracing.NewOTelOrJaegerFromEnv(name, logger)
+	if err != nil {
 		fatal(fmt.Errorf("failed to set up tracing: %w", err))
-	} else {
-		defer trace.Close()
 	}
+	defer trace.Close()
 
 	// Expose HTTP endpoints.
-	srv := newServer(cfg.serverPort, logger, metrics)
+	srv := newServer(cfg, logger, metrics)
 	srv.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	srv.Handle("/ready", readyHandler(ready))
 	srv.PathPrefix("/debug/pprof").Handler(http.DefaultServeMux)
@@ -146,9 +169,24 @@ func main() {
 	check(errors.Wrap(err, "failed to build Kubernetes client config"))
 	instrumentation.InstrumentKubernetesAPIClient(kubeConfig, reg)
 
+	if kubeConfig.Timeout == 0 {
+		kubeConfig.Timeout = cfg.kubeClientTimeout
+	}
 	if kubeConfig.UserAgent == "" {
 		kubeConfig.UserAgent = rest.DefaultKubernetesUserAgent()
 	}
+
+	httpRT := http.DefaultTransport
+	// HTTP client side cluster validation.
+	reporter := func(msg string, method string) {
+		level.Warn(logger).Log("msg", msg, "method", method, "cluster_validation_label", cfg.kubeNamespace)
+		metrics.ClientInvalidClusterValidationLabelRequests.WithLabelValues(method, "http", cfg.kubeNamespace).Inc()
+	}
+	httpRT = middleware.ClusterValidationRoundTripper(cfg.kubeNamespace, reporter, httpRT)
+
+	kubeConfig.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+		return middleware.ClusterValidationRoundTripper(cfg.kubeNamespace, reporter, rt)
+	})
 
 	// share the transport between all clients
 	httpClient, err := rest.HTTPClientFor(kubeConfig)
@@ -170,7 +208,7 @@ func main() {
 	check(errors.Wrap(err, "failed to init dynamicClient"))
 
 	// Start TLS server if enabled.
-	maybeStartTLSServer(cfg, logger, kubeClient, restart, metrics)
+	maybeStartTLSServer(cfg, httpRT, logger, kubeClient, restart, metrics)
 
 	// Init the controller.
 	c := controller.NewRolloutController(kubeClient, restMapper, scaleClient, dynamicClient, cfg.kubeNamespace, httpClient, cfg.reconcileInterval, cfg.oomCooldown, reg, logger)
@@ -200,7 +238,7 @@ func waitForSignalOrRestart(logger log.Logger, restart chan string) {
 	}
 }
 
-func maybeStartTLSServer(cfg config, logger log.Logger, kubeClient *kubernetes.Clientset, restart chan string, metrics *metrics) {
+func maybeStartTLSServer(cfg config, rt http.RoundTripper, logger log.Logger, kubeClient *kubernetes.Clientset, restart chan string, metrics *metrics) {
 	if !cfg.serverTLSEnabled {
 		level.Info(logger).Log("msg", "tls server is not enabled")
 		return
@@ -237,10 +275,10 @@ func maybeStartTLSServer(cfg config, logger log.Logger, kubeClient *kubernetes.C
 	}
 
 	prepDownscaleAdmitFunc := func(ctx context.Context, logger log.Logger, ar v1.AdmissionReview, api *kubernetes.Clientset) *v1.AdmissionResponse {
-		return admission.PrepareDownscale(ctx, logger, ar, api, cfg.useZoneTracker, cfg.zoneTrackerConfigMapName)
+		return admission.PrepareDownscale(ctx, rt, logger, ar, api, cfg.useZoneTracker, cfg.zoneTrackerConfigMapName)
 	}
 
-	tlsSrv, err := newTLSServer(cfg.serverTLSPort, logger, cert, metrics)
+	tlsSrv, err := newTLSServer(cfg, logger, cert, metrics)
 	check(errors.Wrap(err, "failed to create tls server"))
 	tlsSrv.Handle(admission.NoDownscaleWebhookPath, admission.Serve(admission.NoDownscale, logger, kubeClient))
 	tlsSrv.Handle(admission.PrepareDownscaleWebhookPath, admission.Serve(prepDownscaleAdmitFunc, logger, kubeClient))
@@ -282,8 +320,17 @@ func buildKubeConfig(apiURL, cfgFile string) (*rest.Config, error) {
 	return rest.InClusterConfig()
 }
 
-func initLogger(minLevel string) (log.Logger, error) {
-	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
+func initLogger(logFormat, minLevel string) (log.Logger, error) {
+	var logger log.Logger
+	switch logFormat {
+	case "logfmt":
+		logger = log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
+	case "json":
+		logger = log.NewJSONLogger(log.NewSyncWriter(os.Stderr))
+	default:
+		return nil, fmt.Errorf("unknown log format: %s", logFormat)
+	}
+
 	var options []level.Option
 
 	switch minLevel {

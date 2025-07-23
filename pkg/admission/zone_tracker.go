@@ -10,8 +10,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/spanlogger"
-	"github.com/opentracing/opentracing-go"
-	v1 "k8s.io/api/admission/v1"
+	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -34,9 +33,9 @@ type zoneInfo struct {
 }
 
 // Use a ConfigMap instead of an annotation to track the last time zones were downscaled
-func (zt *zoneTracker) prepareDownscale(ctx context.Context, l log.Logger, ar v1.AdmissionReview, api kubernetes.Interface, client httpClient) *v1.AdmissionResponse {
+func (zt *zoneTracker) prepareDownscale(ctx context.Context, l log.Logger, ar admissionv1.AdmissionReview, api kubernetes.Interface, client httpClient) *admissionv1.AdmissionResponse {
 	logger, ctx := spanlogger.New(ctx, l, "zoneTracker.prepareDownscale()", tenantResolver)
-	defer logger.Span.Finish()
+	defer logger.Finish()
 
 	logger.SetSpanAndLogTag("object.name", ar.Request.Name)
 	logger.SetSpanAndLogTag("object.resource", ar.Request.Resource.Resource)
@@ -45,7 +44,7 @@ func (zt *zoneTracker) prepareDownscale(ctx context.Context, l log.Logger, ar v1
 	logger.SetSpanAndLogTag("request.uid", ar.Request.UID)
 
 	if *ar.Request.DryRun {
-		return &v1.AdmissionResponse{Allowed: true}
+		return &admissionv1.AdmissionResponse{Allowed: true}
 	}
 
 	oldInfo, err := decodeAndReplicas(ar.Request.OldObject.Raw)
@@ -67,50 +66,64 @@ func (zt *zoneTracker) prepareDownscale(ctx context.Context, l log.Logger, ar v1
 		return response
 	}
 
-	// Get the labels and annotations from the old object including the prepare downscale label
-	lbls, annotations, err := getLabelsAndAnnotations(ctx, ar, api, oldInfo)
+	stsPrepareInfo, err := getStatefulSetPrepareInfo(ctx, ar, api, oldInfo)
 	if err != nil {
 		return allowWarn(logger, fmt.Sprintf("%s, allowing the change", err))
 	}
 
-	if lbls[config.PrepareDownscaleLabelKey] != config.PrepareDownscaleLabelValue {
-		// Not labeled, nothing to do.
-		return &v1.AdmissionResponse{Allowed: true}
+	if !stsPrepareInfo.prepareDownscale {
+		// Nothing to do.
+		return &admissionv1.AdmissionResponse{Allowed: true}
 	}
 
-	port := annotations[config.PrepareDownscalePortAnnotationKey]
-	if port == "" {
+	if stsPrepareInfo.port == "" {
 		level.Warn(logger).Log("msg", fmt.Sprintf("downscale not allowed because the %v annotation is not set or empty", config.PrepareDownscalePortAnnotationKey))
 		return deny(
-			"downscale of %s/%s in %s from %d to %d replicas is not allowed because the %v annotation is not set or empty.",
-			ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas, config.PrepareDownscalePortAnnotationKey,
+			fmt.Sprintf(
+				"downscale of %s/%s in %s from %d to %d replicas is not allowed because the %v annotation is not set or empty.",
+				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas, config.PrepareDownscalePortAnnotationKey,
+			),
 		)
 	}
 
-	path := annotations[config.PrepareDownscalePathAnnotationKey]
-	if path == "" {
+	if stsPrepareInfo.path == "" {
 		level.Warn(logger).Log("msg", fmt.Sprintf("downscale not allowed because the %v annotation is not set or empty", config.PrepareDownscalePathAnnotationKey))
 		return deny(
-			"downscale of %s/%s in %s from %d to %d replicas is not allowed because the %v annotation is not set or empty.",
-			ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas, config.PrepareDownscalePathAnnotationKey,
+			fmt.Sprintf(
+				"downscale of %s/%s in %s from %d to %d replicas is not allowed because the %v annotation is not set or empty.",
+				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas, config.PrepareDownscalePathAnnotationKey,
+			),
 		)
 	}
 
-	rolloutGroup := lbls[config.RolloutGroupLabelKey]
-	if rolloutGroup != "" {
-		stsList, err := findStatefulSetsForRolloutGroup(ctx, api, ar.Request.Namespace, rolloutGroup)
+	if stsPrepareInfo.serviceName == "" {
+		level.Warn(logger).Log("msg", "downscale not allowed because the serviceName is not set or empty")
+		return deny(
+			fmt.Sprintf(
+				"downscale of %s/%s in %s from %d to %d replicas is not allowed because the serviceName is not set or empty.",
+				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+			),
+		)
+	}
+
+	if stsPrepareInfo.rolloutGroup != "" {
+		stsList, err := findStatefulSetsForRolloutGroup(ctx, api, ar.Request.Namespace, stsPrepareInfo.rolloutGroup)
 		if err != nil {
 			level.Warn(logger).Log("msg", "downscale not allowed due to error while finding other statefulsets", "err", err)
 			return deny(
-				"downscale of %s/%s in %s from %d to %d replicas is not allowed because finding other statefulsets failed.",
-				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+				fmt.Sprintf(
+					"downscale of %s/%s in %s from %d to %d replicas is not allowed because finding other statefulsets failed.",
+					ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+				),
 			)
 		}
 		if err := zt.loadZones(ctx, stsList); err != nil {
 			level.Warn(logger).Log("msg", "downscale not allowed due to error while loading zones", "err", err)
 			return deny(
-				"downscale of %s/%s in %s from %d to %d replicas is not allowed because loading zones failed.",
-				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+				fmt.Sprintf(
+					"downscale of %s/%s in %s from %d to %d replicas is not allowed because loading zones failed.",
+					ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+				),
 			)
 		}
 		// Check if the zone has been downscaled recently.
@@ -118,15 +131,16 @@ func (zt *zoneTracker) prepareDownscale(ctx context.Context, l log.Logger, ar v1
 		if err != nil {
 			level.Warn(logger).Log("msg", "downscale not allowed due to error while parsing downscale timestamps from the zone ConfigMap", "err", err)
 			return deny(
-				"downscale of %s/%s in %s from %d to %d replicas is not allowed because parsing parsing downscale timestamps from the zone ConfigMap failed.",
-				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+				fmt.Sprintf(
+					"downscale of %s/%s in %s from %d to %d replicas is not allowed because parsing parsing downscale timestamps from the zone ConfigMap failed.",
+					ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+				),
 			)
 		}
 		if foundSts != nil {
 			msg := fmt.Sprintf("downscale of %s/%s in %s from %d to %d replicas is not allowed because statefulset %v was downscaled at %v and is labelled to wait %s between zone downscales",
 				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas, foundSts.name, foundSts.lastDownscaleTime, foundSts.waitTime)
 			level.Warn(logger).Log("msg", msg, "err", err)
-			//nolint:govet
 			return deny(msg)
 		}
 		foundSts, err = findStatefulSetWithNonUpdatedReplicas(ctx, api, ar.Request.Namespace, stsList, ar.Request.Name)
@@ -134,20 +148,18 @@ func (zt *zoneTracker) prepareDownscale(ctx context.Context, l log.Logger, ar v1
 			msg := fmt.Sprintf("downscale of %s/%s in %s from %d to %d replicas is not allowed because an error occurred while checking whether StatefulSets have non-updated replicas",
 				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas)
 			level.Warn(logger).Log("msg", msg, "err", err)
-			//nolint:govet
 			return deny(msg)
 		}
 		if foundSts != nil {
 			msg := fmt.Sprintf("downscale of %s/%s in %s from %d to %d replicas is not allowed because statefulset %v has %d non-updated replicas and %d non-ready replicas",
 				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas, foundSts.name, foundSts.nonUpdatedReplicas, foundSts.nonReadyReplicas)
 			level.Warn(logger).Log("msg", msg)
-			//nolint:govet
 			return deny(msg)
 		}
 	}
 
 	// It's a downscale, so we need to prepare the pods that are going away for shutdown.
-	eps := createEndpoints(ar, oldInfo, newInfo, port, path)
+	eps := createEndpoints(ar, oldInfo, newInfo, stsPrepareInfo.port, stsPrepareInfo.path, stsPrepareInfo.serviceName)
 
 	err = sendPrepareShutdownRequests(ctx, logger, client, eps)
 	if err != nil {
@@ -159,8 +171,10 @@ func (zt *zoneTracker) prepareDownscale(ctx context.Context, l log.Logger, ar v1
 		undoPrepareShutdownRequests(ctx, logger, client, eps)
 
 		return deny(
-			"downscale of %s/%s in %s from %d to %d replicas is not allowed because one or more pods failed to prepare for shutdown.",
-			ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+			fmt.Sprintf(
+				"downscale of %s/%s in %s from %d to %d replicas is not allowed because one or more pods failed to prepare for shutdown.",
+				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+			),
 		)
 	}
 
@@ -170,14 +184,16 @@ func (zt *zoneTracker) prepareDownscale(ctx context.Context, l log.Logger, ar v1
 		level.Error(logger).Log("msg", "downscale not allowed due to error while adding annotation. unpreparing...", "err", err)
 		undoPrepareShutdownRequests(ctx, logger, client, eps)
 		return deny(
-			"downscale of %s/%s in %s from %d to %d replicas is not allowed because setting downscale timestamp in the zone ConfigMap failed.",
-			ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+			fmt.Sprintf(
+				"downscale of %s/%s in %s from %d to %d replicas is not allowed because setting downscale timestamp in the zone ConfigMap failed.",
+				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+			),
 		)
 	}
 
 	// Otherwise, we've made it through the gauntlet, and the downscale is allowed.
 	level.Info(logger).Log("msg", "downscale allowed")
-	return &v1.AdmissionResponse{
+	return &admissionv1.AdmissionResponse{
 		Allowed: true,
 		Result: &metav1.Status{
 			Message: fmt.Sprintf("downscale of %s/%s in %s from %d to %d replicas is allowed -- all pods successfully prepared for shutdown.", ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas),
@@ -187,8 +203,8 @@ func (zt *zoneTracker) prepareDownscale(ctx context.Context, l log.Logger, ar v1
 
 // Create the ConfigMap and populate each zone with the current time as a starting point
 func (zt *zoneTracker) createConfigMap(ctx context.Context, stsList *appsv1.StatefulSetList) (*corev1.ConfigMap, error) {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "zoneTracker.createConfigMap()")
-	defer span.Finish()
+	ctx, span := tracer.Start(ctx, "zoneTracker.createConfigMap()")
+	defer span.End()
 
 	defaultInfo := &zoneInfo{LastDownscaled: time.Now().UTC().Format(time.RFC3339)}
 	zones := make(map[string]zoneInfo, len(stsList.Items))
@@ -220,8 +236,8 @@ func (zt *zoneTracker) createConfigMap(ctx context.Context, stsList *appsv1.Stat
 
 // Get the zoneTracker ConfigMap if it exists, or nil if it does not exist
 func (zt *zoneTracker) getConfigMap(ctx context.Context) (*corev1.ConfigMap, error) {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "zoneTracker.getConfigMap()")
-	defer span.Finish()
+	ctx, span := tracer.Start(ctx, "zoneTracker.getConfigMap()")
+	defer span.End()
 
 	cm, err := zt.client.CoreV1().ConfigMaps(zt.namespace).Get(ctx, zt.configMapName, metav1.GetOptions{})
 	if err != nil {
@@ -237,8 +253,8 @@ func (zt *zoneTracker) getConfigMap(ctx context.Context) (*corev1.ConfigMap, err
 
 // Get the zoneTracker ConfigMap if it exists, otherwise create it
 func (zt *zoneTracker) getOrCreateConfigMap(ctx context.Context, stsList *appsv1.StatefulSetList) (*corev1.ConfigMap, error) {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "zoneTracker.getOrCreateConfigMap()")
-	defer span.Finish()
+	ctx, span := tracer.Start(ctx, "zoneTracker.getOrCreateConfigMap()")
+	defer span.End()
 
 	if cm, err := zt.getConfigMap(ctx); err != nil {
 		return nil, err
@@ -271,8 +287,8 @@ func (zt *zoneTracker) loadZones(ctx context.Context, stsList *appsv1.StatefulSe
 
 // Save the zones map to the zoneTracker ConfigMap
 func (zt *zoneTracker) saveZones(ctx context.Context) error {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "zoneTracker.saveZones()")
-	defer span.Finish()
+	ctx, span := tracer.Start(ctx, "zoneTracker.saveZones()")
+	defer span.End()
 
 	// Convert the zones map to ConfigMap data
 	data := make(map[string]string)

@@ -6,15 +6,18 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/spanlogger"
-	"github.com/opentracing-contrib/go-stdlib/nethttp"
-	"github.com/opentracing/opentracing-go"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
-	v1 "k8s.io/api/admission/v1"
+	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -35,10 +38,12 @@ const (
 	maxPrepareGoroutines        = 32
 )
 
-func PrepareDownscale(ctx context.Context, logger log.Logger, ar v1.AdmissionReview, api *kubernetes.Clientset, useZoneTracker bool, zoneTrackerConfigMapName string) *v1.AdmissionResponse {
+func PrepareDownscale(ctx context.Context, rt http.RoundTripper, logger log.Logger, ar admissionv1.AdmissionReview, api *kubernetes.Clientset, useZoneTracker bool, zoneTrackerConfigMapName string) *admissionv1.AdmissionResponse {
 	client := &http.Client{
-		Timeout:   5 * time.Second,
-		Transport: &nethttp.Transport{RoundTripper: http.DefaultTransport},
+		Timeout: 5 * time.Second,
+		Transport: otelhttp.NewTransport(rt, otelhttp.WithClientTrace(func(ctx context.Context) *httptrace.ClientTrace {
+			return otelhttptrace.NewClientTrace(ctx)
+		})),
 	}
 
 	if useZoneTracker {
@@ -53,9 +58,9 @@ type httpClient interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
-func prepareDownscale(ctx context.Context, l log.Logger, ar v1.AdmissionReview, api kubernetes.Interface, client httpClient) *v1.AdmissionResponse {
+func prepareDownscale(ctx context.Context, l log.Logger, ar admissionv1.AdmissionReview, api kubernetes.Interface, client httpClient) *admissionv1.AdmissionResponse {
 	logger, ctx := spanlogger.New(ctx, l, "admission.prepareDownscale()", tenantResolver)
-	defer logger.Span.Finish()
+	defer logger.Finish()
 
 	logger.SetSpanAndLogTag("object.name", ar.Request.Name)
 	logger.SetSpanAndLogTag("object.resource", ar.Request.Resource.Resource)
@@ -64,7 +69,7 @@ func prepareDownscale(ctx context.Context, l log.Logger, ar v1.AdmissionReview, 
 	logger.SetSpanAndLogTag("request.uid", ar.Request.UID)
 
 	if *ar.Request.DryRun {
-		return &v1.AdmissionResponse{Allowed: true}
+		return &admissionv1.AdmissionResponse{Allowed: true}
 	}
 
 	oldInfo, err := decodeAndReplicas(ar.Request.OldObject.Raw)
@@ -86,59 +91,72 @@ func prepareDownscale(ctx context.Context, l log.Logger, ar v1.AdmissionReview, 
 		return response
 	}
 
-	// Get the labels and annotations from the old object including the prepare downscale label
-	lbls, annotations, err := getLabelsAndAnnotations(ctx, ar, api, oldInfo)
+	stsPrepareInfo, err := getStatefulSetPrepareInfo(ctx, ar, api, oldInfo)
 	if err != nil {
 		return allowWarn(logger, fmt.Sprintf("%s, allowing the change", err))
 	}
 
-	// Since it's a downscale, check if the resource has the label that indicates it needs to be prepared to be downscaled.
-	if lbls[config.PrepareDownscaleLabelKey] != config.PrepareDownscaleLabelValue {
-		// Not labeled, nothing to do.
-		return &v1.AdmissionResponse{Allowed: true}
+	// Since it's a downscale, check if the resource needs to be prepared to be downscaled.
+	if !stsPrepareInfo.prepareDownscale {
+		// Nothing to do.
+		return &admissionv1.AdmissionResponse{Allowed: true}
 	}
 
-	port := annotations[config.PrepareDownscalePortAnnotationKey]
-	if port == "" {
+	if stsPrepareInfo.port == "" {
 		level.Warn(logger).Log("msg", fmt.Sprintf("downscale not allowed because the %v annotation is not set or empty", config.PrepareDownscalePortAnnotationKey))
 		return deny(
-			"downscale of %s/%s in %s from %d to %d replicas is not allowed because the %v annotation is not set or empty.",
-			ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas, config.PrepareDownscalePortAnnotationKey,
+			fmt.Sprintf(
+				"downscale of %s/%s in %s from %d to %d replicas is not allowed because the %v annotation is not set or empty.",
+				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas, config.PrepareDownscalePortAnnotationKey,
+			),
 		)
 	}
 
-	path := annotations[config.PrepareDownscalePathAnnotationKey]
-	if path == "" {
+	if stsPrepareInfo.path == "" {
 		level.Warn(logger).Log("msg", fmt.Sprintf("downscale not allowed because the %v annotation is not set or empty", config.PrepareDownscalePathAnnotationKey))
 		return deny(
-			"downscale of %s/%s in %s from %d to %d replicas is not allowed because the %v annotation is not set or empty.",
-			ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas, config.PrepareDownscalePathAnnotationKey,
+			fmt.Sprintf(
+				"downscale of %s/%s in %s from %d to %d replicas is not allowed because the %v annotation is not set or empty.",
+				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas, config.PrepareDownscalePathAnnotationKey,
+			),
 		)
 	}
 
-	rolloutGroup := lbls[config.RolloutGroupLabelKey]
-	if rolloutGroup != "" {
-		stsList, err := findStatefulSetsForRolloutGroup(ctx, api, ar.Request.Namespace, rolloutGroup)
+	if stsPrepareInfo.serviceName == "" {
+		level.Warn(logger).Log("msg", "downscale not allowed because the serviceName is not set or empty")
+		return deny(
+			fmt.Sprintf(
+				"downscale of %s/%s in %s from %d to %d replicas is not allowed because the serviceName is not set or empty.",
+				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+			),
+		)
+	}
+
+	if stsPrepareInfo.rolloutGroup != "" {
+		stsList, err := findStatefulSetsForRolloutGroup(ctx, api, ar.Request.Namespace, stsPrepareInfo.rolloutGroup)
 		if err != nil {
 			level.Warn(logger).Log("msg", "downscale not allowed due to error while finding other statefulsets", "err", err)
 			return deny(
-				"downscale of %s/%s in %s from %d to %d replicas is not allowed because finding other statefulsets failed.",
-				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+				fmt.Sprintf(
+					"downscale of %s/%s in %s from %d to %d replicas is not allowed because finding other statefulsets failed.",
+					ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+				),
 			)
 		}
 		foundSts, err := findDownscalesDoneMinTimeAgo(stsList, ar.Request.Name)
 		if err != nil {
 			level.Warn(logger).Log("msg", "downscale not allowed due to error while parsing downscale annotations", "err", err)
 			return deny(
-				"downscale of %s/%s in %s from %d to %d replicas is not allowed because parsing downscale annotations failed.",
-				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+				fmt.Sprintf(
+					"downscale of %s/%s in %s from %d to %d replicas is not allowed because parsing downscale annotations failed.",
+					ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+				),
 			)
 		}
 		if foundSts != nil {
 			msg := fmt.Sprintf("downscale of %s/%s in %s from %d to %d replicas is not allowed because statefulset %v was downscaled at %v and is labelled to wait %s between zone downscales",
 				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas, foundSts.name, foundSts.lastDownscaleTime, foundSts.waitTime)
 			level.Warn(logger).Log("msg", msg, "err", err)
-			//nolint:govet
 			return deny(msg)
 		}
 		foundSts, err = findStatefulSetWithNonUpdatedReplicas(ctx, api, ar.Request.Namespace, stsList, ar.Request.Name)
@@ -146,20 +164,18 @@ func prepareDownscale(ctx context.Context, l log.Logger, ar v1.AdmissionReview, 
 			msg := fmt.Sprintf("downscale of %s/%s in %s from %d to %d replicas is not allowed because an error occurred while checking whether StatefulSets have non-updated replicas",
 				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas)
 			level.Warn(logger).Log("msg", msg, "err", err)
-			//nolint:govet
 			return deny(msg)
 		}
 		if foundSts != nil {
 			msg := fmt.Sprintf("downscale of %s/%s in %s from %d to %d replicas is not allowed because statefulset %v has %d non-updated replicas and %d non-ready replicas",
 				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas, foundSts.name, foundSts.nonUpdatedReplicas, foundSts.nonReadyReplicas)
 			level.Warn(logger).Log("msg", msg)
-			//nolint:govet
 			return deny(msg)
 		}
 	}
 
 	// It's a downscale, so we need to prepare the pods that are going away for shutdown.
-	eps := createEndpoints(ar, oldInfo, newInfo, port, path)
+	eps := createEndpoints(ar, oldInfo, newInfo, stsPrepareInfo.port, stsPrepareInfo.path, stsPrepareInfo.serviceName)
 
 	if err := sendPrepareShutdownRequests(ctx, logger, client, eps); err != nil {
 		// Down-scale operation is disallowed because at least one pod failed to
@@ -170,8 +186,10 @@ func prepareDownscale(ctx context.Context, l log.Logger, ar v1.AdmissionReview, 
 		undoPrepareShutdownRequests(ctx, logger, client, eps)
 
 		return deny(
-			"downscale of %s/%s in %s from %d to %d replicas is not allowed because one or more pods failed to prepare for shutdown.",
-			ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+			fmt.Sprintf(
+				"downscale of %s/%s in %s from %d to %d replicas is not allowed because one or more pods failed to prepare for shutdown.",
+				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+			),
 		)
 	}
 
@@ -182,14 +200,16 @@ func prepareDownscale(ctx context.Context, l log.Logger, ar v1.AdmissionReview, 
 		undoPrepareShutdownRequests(ctx, logger, client, eps)
 
 		return deny(
-			"downscale of %s/%s in %s from %d to %d replicas is not allowed because adding an annotation to the statefulset failed.",
-			ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+			fmt.Sprintf(
+				"downscale of %s/%s in %s from %d to %d replicas is not allowed because adding an annotation to the statefulset failed.",
+				ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas,
+			),
 		)
 	}
 
 	// Otherwise, we've made it through the gauntlet, and the downscale is allowed.
 	level.Info(logger).Log("msg", "downscale allowed")
-	return &v1.AdmissionResponse{
+	return &admissionv1.AdmissionResponse{
 		Allowed: true,
 		Result: &metav1.Status{
 			Message: fmt.Sprintf("downscale of %s/%s in %s from %d to %d replicas is allowed -- all pods successfully prepared for shutdown.", ar.Request.Resource.Resource, ar.Request.Name, ar.Request.Namespace, *oldInfo.replicas, *newInfo.replicas),
@@ -197,22 +217,54 @@ func prepareDownscale(ctx context.Context, l log.Logger, ar v1.AdmissionReview, 
 	}
 }
 
-// deny returns a *v1.AdmissionResponse with Allowed: false and the message provided formatted with as in fmt.Sprintf.
-func deny(msg string, args ...any) *v1.AdmissionResponse {
-	return &v1.AdmissionResponse{
+type statefulSetPrepareInfo struct {
+	prepareDownscale bool
+	port             string
+	path             string
+	rolloutGroup     string
+	serviceName      string
+}
+
+func getStatefulSetPrepareInfo(ctx context.Context, ar admissionv1.AdmissionReview, api kubernetes.Interface, info *objectInfo) (*statefulSetPrepareInfo, error) {
+	var sts *appsv1.StatefulSet
+	switch o := info.obj.(type) {
+	case *appsv1.StatefulSet:
+		sts = o
+	case *autoscalingv1.Scale:
+		var err error
+		sts, err = getStatefulSet(ctx, ar, api)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unsupported type %s (go type %T)", info.gvk, info.obj)
+	}
+
+	return &statefulSetPrepareInfo{
+		prepareDownscale: sts.Labels[config.PrepareDownscaleLabelKey] == config.PrepareDownscaleLabelValue,
+		port:             sts.Annotations[config.PrepareDownscalePortAnnotationKey],
+		path:             sts.Annotations[config.PrepareDownscalePathAnnotationKey],
+		rolloutGroup:     sts.Labels[config.RolloutGroupLabelKey],
+		serviceName:      sts.Spec.ServiceName,
+	}, nil
+}
+
+// deny returns a *v1.AdmissionResponse with Allowed: false and the message provided
+func deny(msg string) *admissionv1.AdmissionResponse {
+	return &admissionv1.AdmissionResponse{
 		Allowed: false,
 		Result: &metav1.Status{
-			Message: fmt.Sprintf(msg, args...),
+			Message: msg,
 		},
 	}
 }
 
-func getResourceAnnotations(ctx context.Context, ar v1.AdmissionReview, api kubernetes.Interface) (map[string]string, error) {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "admission.getResourceAnnotations()")
-	defer span.Finish()
-
-	span.SetTag("object.namespace", ar.Request.Namespace)
-	span.SetTag("object.name", ar.Request.Name)
+func getStatefulSet(ctx context.Context, ar admissionv1.AdmissionReview, api kubernetes.Interface) (*appsv1.StatefulSet, error) {
+	ctx, span := tracer.Start(ctx, "admission.getStatefulSet()", trace.WithAttributes(
+		attribute.String("object.namespace", ar.Request.Namespace),
+		attribute.String("object.name", ar.Request.Name),
+	))
+	defer span.End()
 
 	switch ar.Request.Resource.Resource {
 	case "statefulsets":
@@ -220,17 +272,17 @@ func getResourceAnnotations(ctx context.Context, ar v1.AdmissionReview, api kube
 		if err != nil {
 			return nil, err
 		}
-		return obj.Annotations, nil
+		return obj, nil
 	}
 	return nil, fmt.Errorf("unsupported resource %s", ar.Request.Resource.Resource)
 }
 
 func addDownscaledAnnotationToStatefulSet(ctx context.Context, api kubernetes.Interface, namespace, stsName string) error {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "admission.addDownscaledAnnotationToStatefulSet()")
-	defer span.Finish()
-
-	span.SetTag("object.namespace", namespace)
-	span.SetTag("object.name", stsName)
+	ctx, span := tracer.Start(ctx, "admission.addDownscaledAnnotationToStatefulSet()", trace.WithAttributes(
+		attribute.String("object.namespace", namespace),
+		attribute.String("object.name", stsName),
+	))
+	defer span.End()
 
 	client := api.AppsV1().StatefulSets(namespace)
 	patch := fmt.Sprintf(`{"metadata":{"annotations":{"%v":"%v"}}}`, config.LastDownscaleAnnotationKey, time.Now().UTC().Format(time.RFC3339))
@@ -297,10 +349,10 @@ func findDownscalesDoneMinTimeAgo(stsList *appsv1.StatefulSetList, excludeStsNam
 //
 // The StatefulSet whose name matches the input excludeStsName is not checked.
 func findStatefulSetWithNonUpdatedReplicas(ctx context.Context, api kubernetes.Interface, namespace string, stsList *appsv1.StatefulSetList, excludeStsName string) (*statefulSetDownscale, error) {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "admission.findStatefulSetWithNonUpdatedReplicas()")
-	defer span.Finish()
-
-	span.SetTag("object.namespace", namespace)
+	ctx, span := tracer.Start(ctx, "admission.findStatefulSetWithNonUpdatedReplicas()", trace.WithAttributes(
+		attribute.String("object.namespace", namespace),
+	))
+	defer span.End()
 
 	for _, sts := range stsList.Items {
 		if sts.Name == excludeStsName {
@@ -324,11 +376,11 @@ func findStatefulSetWithNonUpdatedReplicas(ctx context.Context, api kubernetes.I
 
 // countRunningAndReadyPods counts running and ready pods for a StatefulSet.
 func countRunningAndReadyPods(ctx context.Context, api kubernetes.Interface, namespace string, sts *appsv1.StatefulSet) (int, error) {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "admission.countRunningAndReadyPods()")
-	defer span.Finish()
-
-	span.SetTag("object.namespace", namespace)
-	span.SetTag("object.name", sts.Name)
+	ctx, span := tracer.Start(ctx, "admission.countRunningAndReadyPods()", trace.WithAttributes(
+		attribute.String("object.namespace", namespace),
+		attribute.String("object.name", sts.Name),
+	))
+	defer span.End()
 
 	pods, err := findPodsForStatefulSet(ctx, api, namespace, sts)
 	if err != nil {
@@ -355,11 +407,11 @@ func findPodsForStatefulSet(ctx context.Context, api kubernetes.Interface, names
 }
 
 func findStatefulSetsForRolloutGroup(ctx context.Context, api kubernetes.Interface, namespace, rolloutGroup string) (*appsv1.StatefulSetList, error) {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "admission.findStatefulSetsForRolloutGroup()")
-	defer span.Finish()
-
-	span.SetTag("object.namespace", namespace)
-	span.SetTag("rollout_group", rolloutGroup)
+	ctx, span := tracer.Start(ctx, "admission.findStatefulSetsForRolloutGroup()", trace.WithAttributes(
+		attribute.String("object.namespace", namespace),
+		attribute.String("rollout_group", rolloutGroup),
+	))
+	defer span.End()
 
 	groupReq, err := labels.NewRequirement(config.RolloutGroupLabelKey, selection.Equals, []string{rolloutGroup})
 	if err != nil {
@@ -396,11 +448,11 @@ func decodeAndReplicas(raw []byte) (*objectInfo, error) {
 }
 
 // Verify that the replicas change is a downscale and not an upscale, otherwise allow the change
-func checkReplicasChange(logger log.Logger, oldInfo, newInfo *objectInfo) *v1.AdmissionResponse {
+func checkReplicasChange(logger log.Logger, oldInfo, newInfo *objectInfo) *admissionv1.AdmissionResponse {
 	// Both replicas are nil, nothing to warn about.
 	if oldInfo.replicas == nil && newInfo.replicas == nil {
 		level.Debug(logger).Log("msg", "no replicas change, allowing")
-		return &v1.AdmissionResponse{Allowed: true}
+		return &admissionv1.AdmissionResponse{Allowed: true}
 	}
 	// Changes from/to nil scale are not downscales strictly speaking.
 	if oldInfo.replicas == nil || newInfo.replicas == nil {
@@ -409,61 +461,30 @@ func checkReplicasChange(logger log.Logger, oldInfo, newInfo *objectInfo) *v1.Ad
 	// If it's not a downscale, just log debug.
 	if *oldInfo.replicas < *newInfo.replicas {
 		level.Debug(logger).Log("msg", "upscale allowed")
-		return &v1.AdmissionResponse{Allowed: true}
+		return &admissionv1.AdmissionResponse{Allowed: true}
 	}
 	if *oldInfo.replicas == *newInfo.replicas {
 		level.Debug(logger).Log("msg", "no replicas change, allowing")
-		return &v1.AdmissionResponse{Allowed: true}
+		return &admissionv1.AdmissionResponse{Allowed: true}
 	}
 	// If none of the above conditions are met, it's a downscale.
 	return nil
 }
 
-func getLabelsAndAnnotations(ctx context.Context, ar v1.AdmissionReview, api kubernetes.Interface, info *objectInfo) (map[string]string, map[string]string, error) {
-	var lbls, annotations map[string]string
-	var err error
-
-	switch o := info.obj.(type) {
-	case *appsv1.Deployment:
-		lbls = o.Labels
-		annotations = o.Annotations
-	case *appsv1.StatefulSet:
-		lbls = o.Labels
-		annotations = o.Annotations
-	case *appsv1.ReplicaSet:
-		lbls = o.Labels
-		annotations = o.Annotations
-	case *autoscalingv1.Scale:
-		lbls, err = getResourceLabels(ctx, ar, api)
-		if err != nil {
-			return nil, nil, err
-		}
-		annotations, err = getResourceAnnotations(ctx, ar, api)
-		if err != nil {
-			return nil, nil, err
-		}
-	default:
-		return nil, nil, fmt.Errorf("unsupported type %T", o)
-	}
-
-	return lbls, annotations, nil
-}
-
-func createEndpoints(ar v1.AdmissionReview, oldInfo, newInfo *objectInfo, port, path string) []endpoint {
+func createEndpoints(ar admissionv1.AdmissionReview, oldInfo, newInfo *objectInfo, port, path, serviceName string) []endpoint {
 	diff := (*oldInfo.replicas - *newInfo.replicas)
 	eps := make([]endpoint, diff)
 
 	// The DNS entry for a pod of a stateful set is
 	// ingester-zone-a-0.$(servicename).$(namespace).svc.cluster.local
-	// The service in this case is ingester-zone-a as well.
 	// https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#stable-network-id
 
-	for i := 0; i < int(diff); i++ {
+	for i := range int(diff) {
 		index := int(*oldInfo.replicas) - i - 1 // nr in statefulset
 		eps[i].url = fmt.Sprintf("%v-%v.%v.%v.svc.cluster.local:%s/%s",
 			ar.Request.Name, // pod name
 			index,
-			ar.Request.Name, // svc name
+			serviceName,
 			ar.Request.Namespace,
 			port,
 			path,
@@ -481,7 +502,7 @@ func invokePrepareShutdown(ctx context.Context, method string, parentLogger log.
 	}
 
 	logger, ctx := spanlogger.New(ctx, parentLogger, span, tenantResolver)
-	defer logger.Span.Finish()
+	defer logger.Finish()
 
 	logger.SetSpanAndLogTag("url", ep.url)
 	logger.SetSpanAndLogTag("index", ep.index)
@@ -494,9 +515,6 @@ func invokePrepareShutdown(ctx context.Context, method string, parentLogger log.
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req, ht := nethttp.TraceRequest(opentracing.GlobalTracer(), req)
-	defer ht.Finish()
-
 	resp, err := client.Do(req)
 	if err != nil {
 		level.Error(logger).Log("msg", fmt.Sprintf("error sending HTTP %s request", method), "err", err)
@@ -516,8 +534,8 @@ func invokePrepareShutdown(ctx context.Context, method string, parentLogger log.
 }
 
 func sendPrepareShutdownRequests(ctx context.Context, logger log.Logger, client httpClient, eps []endpoint) error {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "admission.sendPrepareShutdownRequests()")
-	defer span.Finish()
+	ctx, span := tracer.Start(ctx, "admission.sendPrepareShutdownRequests()")
+	defer span.End()
 
 	if len(eps) == 0 {
 		return nil
@@ -542,8 +560,8 @@ func sendPrepareShutdownRequests(ctx context.Context, logger log.Logger, client 
 
 // undoPrepareShutdownRequests sends an HTTP DELETE to each of the given endpoints.
 func undoPrepareShutdownRequests(ctx context.Context, logger log.Logger, client httpClient, eps []endpoint) {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "admission.undoPrepareShutdownRequests()")
-	defer span.Finish()
+	ctx, span := tracer.Start(ctx, "admission.undoPrepareShutdownRequests()")
+	defer span.End()
 
 	if len(eps) == 0 {
 		return
